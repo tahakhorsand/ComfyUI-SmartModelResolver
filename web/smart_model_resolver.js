@@ -285,10 +285,10 @@ app.registerExtension({
         // Helper: Official ComfyUI Desktop & Web Frontend Cache Refresh
         async function refreshComfyUIFrontendState() {
             try {
-                if (typeof app.reloadNodeDefs === "function") {
-                    await app.reloadNodeDefs();
-                } else if (typeof app.refreshComboInNodes === "function") {
+                if (typeof app.refreshComboInNodes === "function") {
                     await app.refreshComboInNodes();
+                } else if (typeof app.reloadNodeDefs === "function") {
+                    await app.reloadNodeDefs();
                 }
             } catch (e) {
                 console.warn("[SmartModelResolver] Node defs reload:", e);
@@ -728,9 +728,9 @@ app.registerExtension({
                     try {
                         const resp = await api.fetchApi("/smart_model_resolver/refresh_cache", { method: "POST" });
                         const data = await resp.json();
-                        await refreshComfyUIFrontendState();
                         card.remove();
                         window.SmartModelResolver_Notify("Drive Rescanned", `Refreshed ComfyUI cache (${data.total_models || 0} models found). Re-evaluating workflow...`, 2500);
+                        refreshComfyUIFrontendState().catch(e => console.warn(e));
                         sessionIgnoredKeys.clear();
                         lastNotifiedSignature = "";
                         setTimeout(() => {
@@ -780,24 +780,33 @@ app.registerExtension({
                         curIdx++;
                     }
 
-                    // Refresh ComfyUI Desktop & Web node defs and missing model stores
-                    await refreshComfyUIFrontendState();
-
-                    card.remove();
+                    // Immediately animate out and remove modal
+                    card.style.opacity = "0";
+                    card.style.transform = "translateX(50px)";
+                    setTimeout(() => card.remove(), 180);
 
                     if (appliedCount > 0) {
                         window.SmartModelResolver_Notify(
                             "Models Updated",
                             `Successfully linked <b>${appliedCount} model(s)</b> to your workflow.`,
-                            3500
+                            3000
                         );
                     }
+
+                    // Immediate canvas repaint
+                    if (app.graph) app.graph.setDirtyCanvas(true, true);
+                    if (app.canvas) app.canvas.draw(true, true);
+
+                    // Sync frontend combo state asynchronously in background
+                    refreshComfyUIFrontendState().catch(e => console.warn(e));
+
                 } catch (err) {
                     console.error("[SmartModelResolver] Error applying replacements:", err);
+                    card.remove();
                 } finally {
                     setTimeout(() => {
                         isApplyingBatch = false;
-                    }, 500);
+                    }, 300);
                 }
             };
         }
