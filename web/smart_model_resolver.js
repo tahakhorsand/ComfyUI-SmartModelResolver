@@ -356,6 +356,30 @@ app.registerExtension({
             const prevCard = document.getElementById("smr-resolver-modal");
             if (prevCard) prevCard.remove();
 
+            // Deduplicate exactResolved by node & target value
+            const uniqueExact = [];
+            const seenExact = new Set();
+            for (const item of exactResolved) {
+                const k = `${item.nodeId}::${item.widgetName}::${String(item.resolvedValue).toLowerCase()}`;
+                if (!seenExact.has(k)) {
+                    seenExact.add(k);
+                    uniqueExact.push(item);
+                }
+            }
+            exactResolved = uniqueExact;
+
+            // Deduplicate suggestions by node & suggested model
+            const uniqueSuggestions = [];
+            const seenSuggestions = new Set();
+            for (const s of suggestions) {
+                const k = `${s.nodeId}::${s.widgetName}::${String(s.suggestedModel).toLowerCase()}`;
+                if (!seenSuggestions.has(k)) {
+                    seenSuggestions.add(k);
+                    uniqueSuggestions.push(s);
+                }
+            }
+            suggestions = uniqueSuggestions;
+
             const totalCount = exactResolved.length + suggestions.length;
             if (totalCount === 0) return;
 
@@ -546,6 +570,14 @@ app.registerExtension({
                 for (const { node, parentSubgraphNode } of allNodeEntries) {
                     if (!node.widgets) continue;
                     for (const w of node.widgets) {
+                        // If this node is inside a subgraph, check if this widget is promoted on parentSubgraphNode
+                        if (parentSubgraphNode && parentSubgraphNode.widgets) {
+                            const isPromoted = parentSubgraphNode.widgets.some(pw =>
+                                pw.name === w.name || (pw.value && String(pw.value).trim().toLowerCase() === String(w.value).trim().toLowerCase())
+                            );
+                            if (isPromoted) continue;
+                        }
+
                         if (w.type === "combo" && w.options && Array.isArray(w.options.values)) {
                             // If options array is empty (unpopulated wrapper or still loading), skip
                             if (w.options.values.length === 0) continue;

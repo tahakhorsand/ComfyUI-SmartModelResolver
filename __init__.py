@@ -7,7 +7,7 @@ from aiohttp import web
 from server import PromptServer
 import folder_paths
 
-from .core.model_indexer import SmartModelIndex, VALID_MODEL_EXTENSIONS
+from .core.model_indexer import SmartModelIndex, VALID_MODEL_EXTENSIONS, GENERIC_SUFFIX_TOKENS
 from .nodes.smart_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 logger = logging.getLogger("SmartModelResolver")
@@ -114,7 +114,7 @@ async def _handle_resolve_batch_impl(request):
                 cat_hint = "diffusion_models"
             elif "vae" in context:
                 cat_hint = "vae"
-            elif "clip" in context or "text_encoder" in context or "conditioning" in context or "t5" in context:
+            elif any(k in context for k in ["clip", "text_encoder", "conditioning", "t5", "gemma", "prompt", "enhance", "llm"]):
                 cat_hint = "text_encoders"
             elif "controlnet" in context:
                 cat_hint = "controlnet"
@@ -178,6 +178,7 @@ async def _handle_resolve_batch_impl(request):
             best_sim_score = 0.0
 
             clean_req_tokens = set(re.findall(r'[a-zA-Z0-9]+', req_stem))
+            req_identity = clean_req_tokens - GENERIC_SUFFIX_TOKENS
 
             # Prioritize available options for this exact widget first
             for opt in available_vals:
@@ -187,16 +188,17 @@ async def _handle_resolve_batch_impl(request):
                 if opt_e not in VALID_MODEL_EXTENSIONS or opt_base == req_base:
                     continue
                 opt_tokens = set(re.findall(r'[a-zA-Z0-9]+', opt_s))
-                common = clean_req_tokens.intersection(opt_tokens)
-                if len(common) < 2 and not (req_stem[:6] == opt_s[:6] and len(req_stem) > 6):
+                opt_identity = opt_tokens - GENERIC_SUFFIX_TOKENS
+                common_identity = req_identity.intersection(opt_identity)
+                if not common_identity and not (req_stem[:5] == opt_s[:5] and len(req_stem) > 4):
                     continue
                 score = difflib.SequenceMatcher(None, req_stem, opt_s).ratio()
                 if score > best_sim_score:
                     best_sim_score = score
                     best_sim_cand = opt
 
-            # Fallback to category candidates on disk
-            if not best_sim_cand or best_sim_score < 0.65:
+            # Fallback to indexing category on disk
+            if not best_sim_cand or best_sim_score < 0.58:
                 sim_res = indexer.find_similar_model(cat_hint, current_val, folder_paths)
                 if sim_res:
                     full_p, rel_p, score = sim_res
@@ -209,7 +211,7 @@ async def _handle_resolve_batch_impl(request):
                                 best_sim_cand = opt
                                 break
 
-            if best_sim_cand and best_sim_score >= 0.65:
+            if best_sim_cand and best_sim_score >= 0.58:
                 # Ensure the suggested model is NOT identical to current_val
                 if best_sim_cand.replace("\\", "/").lower() != clean_val_lower:
                     suggestions.append({
