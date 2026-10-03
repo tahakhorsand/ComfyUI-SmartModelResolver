@@ -547,7 +547,10 @@ app.registerExtension({
                     if (!node.widgets) continue;
                     for (const w of node.widgets) {
                         if (w.type === "combo" && w.options && Array.isArray(w.options.values)) {
-                            const val = String(w.value || "");
+                            // If options array is empty (unpopulated wrapper or still loading), skip
+                            if (w.options.values.length === 0) continue;
+
+                            const val = String(w.value || "").trim();
                             if (!val) continue;
 
                             const lowerVal = val.toLowerCase();
@@ -556,11 +559,14 @@ app.registerExtension({
                                             lowerVal.endsWith(".bin") || lowerVal.endsWith(".sft");
                             if (!isModel) continue;
 
-                            const normVal = val.replace(/\\/g, "/");
-                            const exists = w.options.values.some(opt => opt.replace(/\\/g, "/") === normVal);
+                            const normVal = val.replace(/\\/g, "/").toLowerCase();
+                            const exists = w.options.values.some(opt => {
+                                const normOpt = String(opt).replace(/\\/g, "/").toLowerCase();
+                                return normOpt === normVal || normOpt.endsWith("/" + normVal) || normVal.endsWith("/" + normOpt);
+                            });
 
                             if (!exists) {
-                                const sessionKey = `${node.id}::${w.name}::${val}`;
+                                const sessionKey = `${node.id}::${w.name}::${val.toLowerCase()}`;
                                 if (!manualTrigger && sessionIgnoredKeys.has(sessionKey)) {
                                     continue;
                                 }
