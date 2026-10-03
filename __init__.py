@@ -13,41 +13,92 @@ from .nodes.smart_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 logger = logging.getLogger("SmartModelResolver")
 WEB_DIRECTORY = "./web"
 
-# Hook folder_paths.get_full_path
+# 1. Whitelist .gguf in ComfyUI native folder_paths
+if hasattr(folder_paths, "supported_pt_extensions"):
+    folder_paths.supported_pt_extensions.add(".gguf")
+
+folder_map = getattr(folder_paths, "folder_names_and_paths", {})
+for cat, (dirs, exts) in folder_map.items():
+    if isinstance(exts, set) and (".safetensors" in exts or ".ckpt" in exts):
+        exts.add(".gguf")
+
+# 2. Hook folder_paths.get_filename_list to return up-to-date models without ComfyUI restart
+_orig_get_filename_list = folder_paths.get_filename_list
+
+def smart_get_filename_list(folder_name: str) -> list[str]:
+    folder_name = folder_paths.map_legacy(folder_name) if hasattr(folder_paths, "map_legacy") else folder_name
+    try:
+        base_list = set(_orig_get_filename_list(folder_name))
+    except Exception:
+        base_list = set()
+
+    indexer = SmartModelIndex.get_instance()
+    cached_for_cat = indexer.cached_files_by_category.get(folder_name, [])
+    for rel_p in cached_for_cat:
+        aligned_p = rel_p.replace("/", "\\") if os.sep == "\\" else rel_p
+        base_list.add(aligned_p)
+
+    return sorted(list(base_list))
+
+folder_paths.get_filename_list = smart_get_filename_list
+
+# 3. Hook folder_paths.get_full_path
 _orig_get_full_path = folder_paths.get_full_path
 
 def smart_get_full_path(folder_name: str, filename: str):
     if not filename or not isinstance(filename, str):
         return _orig_get_full_path(folder_name, filename)
 
+    # 1. Absolute path check
+    if os.path.isabs(filename) and (os.path.isfile(filename) or os.path.islink(filename)):
+        return filename
+
+    # 2. Standard resolution
     path = _orig_get_full_path(folder_name, filename)
     if path and (os.path.isfile(path) or os.path.islink(path)):
         return path
+
+    # Standard resolution with alternative slash format
+    alt_fn = filename.replace("/", "\\") if "/" in filename else filename.replace("\\", "/")
+    path_alt = _orig_get_full_path(folder_name, alt_fn)
+    if path_alt and (os.path.isfile(path_alt) or os.path.islink(path_alt)):
+        return path_alt
 
     ext = os.path.splitext(filename)[-1].lower()
     if ext and ext not in VALID_MODEL_EXTENSIONS:
         return None
 
+    # 3. SmartModelIndex subfolder / cross-category resolution
     indexer = SmartModelIndex.get_instance()
     res = indexer.find_model(folder_name, filename, folder_paths)
     if res:
         full_p, rel_p, match_type = res
-        logger.info(f"[SmartModelResolver] Auto-located exact model in subfolder: '{filename}' in '{folder_name}' -> '{full_p}' ({match_type})")
+        logger.info(f"[SmartModelResolver] Auto-located exact model: '{filename}' in '{folder_name}' -> '{full_p}' ({match_type})")
         return full_p
+
+    # 4. Fallback search across all category directories
+    clean_fn = filename.replace("/", os.sep).replace("\\", os.sep).lstrip(os.sep)
+    for cat, (dirs, _) in folder_map.items():
+        for d in dirs:
+            cand_p = os.path.join(d, clean_fn)
+            if os.path.isfile(cand_p) or os.path.islink(cand_p):
+                return cand_p
 
     return None
 
 folder_paths.get_full_path = smart_get_full_path
 
-# Hook execution.validate_prompt to auto-align slash formats and subfolder paths at runtime
+# Hook execution.validate_prompt & validate_inputs to eliminate value_not_in_list for physical files
 try:
     import execution
     import nodes
 
     _orig_validate_prompt = execution.validate_prompt
+    _orig_validate_inputs = getattr(execution, "validate_inputs", None)
 
     async def smart_validate_prompt(prompt_id, prompt, partial_execution_list=None):
         if prompt and isinstance(prompt, dict):
+            indexer = SmartModelIndex.get_instance()
             for node_id, node_data in prompt.items():
                 if not isinstance(node_data, dict):
                     continue
@@ -69,12 +120,24 @@ try:
                     val = inputs[input_name]
                     if not isinstance(val, str):
                         continue
+                    ext = os.path.splitext(val)[-1].lower()
+                    if ext and ext not in VALID_MODEL_EXTENSIONS:
+                        continue
+
                     info = class_inputs.get("required", {}).get(input_name) or class_inputs.get("optional", {}).get(input_name)
                     if not info:
                         continue
-                    combo_options = info[0] if isinstance(info, tuple) and isinstance(info[0], list) else None
-                    if not combo_options:
+                    combo_options = None
+                    if isinstance(info, tuple) and len(info) > 0 and isinstance(info[0], list):
+                        combo_options = info[0]
+                    elif isinstance(info, tuple) and len(info) > 1 and isinstance(info[1], dict) and "options" in info[1]:
+                        combo_options = info[1]["options"]
+                    elif isinstance(info, list):
+                        combo_options = info
+
+                    if combo_options is None:
                         continue
+
                     if val in combo_options:
                         continue
 
@@ -99,13 +162,62 @@ try:
                             if os.path.basename(opt.replace("/", "\\")).lower() == req_base:
                                 inputs[input_name] = opt
                                 logger.info(f"[SmartModelResolver] Auto-located subfolder combo input '{input_name}' for node {node_id}: '{val}' -> '{opt}'")
+                                matched = True
                                 break
+
+                    # 3. Model physically exists on disk or found via SmartModelIndex
+                    if not matched:
+                        res = indexer.find_model("", val, folder_paths)
+                        if res:
+                            full_p, rel_p, match_type = res
+                            aligned_p = rel_p.replace("/", "\\") if os.sep == "\\" else rel_p
+                            inputs[input_name] = aligned_p
+                            if isinstance(combo_options, list):
+                                if aligned_p not in combo_options:
+                                    combo_options.append(aligned_p)
+                                if val not in combo_options:
+                                    combo_options.append(val)
+                            logger.info(f"[SmartModelResolver] Auto-resolved physical disk model '{input_name}' for node {node_id}: '{val}' -> '{aligned_p}'")
 
         return await _orig_validate_prompt(prompt_id, prompt, partial_execution_list)
 
     execution.validate_prompt = smart_validate_prompt
+
+    if _orig_validate_inputs is not None:
+        async def smart_validate_inputs(prompt_id, prompt, item, validated, visiting=None):
+            res = await _orig_validate_inputs(prompt_id, prompt, item, validated, visiting)
+            # res is tuple: (valid: bool, reasons: list, item: str)
+            if not res[0] and isinstance(res[1], list):
+                new_reasons = []
+                for reason in res[1]:
+                    if isinstance(reason, dict) and reason.get("type") == "value_not_in_list":
+                        extra = reason.get("extra_info", {})
+                        inp_name = extra.get("input_name")
+                        rec_val = extra.get("received_value")
+                        if isinstance(rec_val, str):
+                            ext = os.path.splitext(rec_val)[-1].lower()
+                            if ext in VALID_MODEL_EXTENSIONS or not ext:
+                                # Check if file physically exists on disk anywhere
+                                if (os.path.isabs(rec_val) and os.path.isfile(rec_val)) or \
+                                   smart_get_full_path("", rec_val) is not None or \
+                                   check_file_exists_any_category(folder_paths, rec_val) or \
+                                   SmartModelIndex.get_instance().find_model("", rec_val, folder_paths) is not None:
+                                    logger.info(f"[SmartModelResolver] Auto-bypassing value_not_in_list for physically verified file: '{rec_val}' (node #{item}, input '{inp_name}')")
+                                    continue
+                    new_reasons.append(reason)
+
+                if len(new_reasons) == 0:
+                    validated[item] = (True, [], item)
+                    return (True, [], item)
+                elif len(new_reasons) < len(res[1]):
+                    validated[item] = (False, new_reasons, item)
+                    return (False, new_reasons, item)
+
+            return res
+
+        execution.validate_inputs = smart_validate_inputs
 except Exception as e:
-    logger.debug(f"[SmartModelResolver] Could not hook execution.validate_prompt: {e}")
+    logger.debug(f"[SmartModelResolver] Could not hook execution functions: {e}")
 
 # Pre-index in background daemon thread on startup so ComfyUI starts instantly
 def _warmup_indexer():
@@ -132,10 +244,18 @@ def check_file_physically_exists(folder_paths, cat: str, filename: str) -> bool:
     return False
 
 def check_file_exists_any_category(folder_paths, filename: str) -> bool:
+    if not filename:
+        return False
+    if os.path.isabs(filename) and (os.path.isfile(filename) or os.path.islink(filename)):
+        return True
     folder_map = getattr(folder_paths, "folder_names_and_paths", {})
     for cat in folder_map.keys():
         if check_file_physically_exists(folder_paths, cat, filename):
             return True
+    indexer = SmartModelIndex.get_instance()
+    req_base = os.path.basename(filename.replace("\\", "/")).lower()
+    if req_base in indexer.basename_to_paths:
+        return True
     return False
 
 # Register HTTP endpoint for Frontend Auto-Fixer & Suggestions
@@ -247,6 +367,13 @@ async def _handle_resolve_batch_impl(request):
                             break
 
             if matched_val:
+                # If matched_val exists in available_vals with different slash formatting, use the exact option string
+                norm_matched = matched_val.replace("\\", "/").lower()
+                for opt in available_vals:
+                    if opt.replace("\\", "/").lower() == norm_matched:
+                        matched_val = opt
+                        break
+
                 # Only add if it's genuinely a different relative path (ignoring case & slashes)
                 if matched_val.replace("\\", "/").lower() != clean_val_lower:
                     exact_resolved.append({
@@ -312,9 +439,34 @@ async def _handle_resolve_batch_impl(request):
         logger.error(f"[SmartModelResolver] API error: {e}", exc_info=True)
         return web.json_response({"error": str(e)}, status=500)
 
+async def _handle_refresh_cache_impl(request):
+    try:
+        # 1. Clear ComfyUI internal caches
+        if hasattr(folder_paths, "filename_list_cache"):
+            folder_paths.filename_list_cache.clear()
+        if hasattr(folder_paths, "cache_helper") and folder_paths.cache_helper is not None:
+            folder_paths.cache_helper.clear()
+
+        # 2. Rescan disk models
+        indexer = SmartModelIndex.get_instance()
+        indexer.scan_all(folder_paths, force=True)
+
+        total_models = sum(len(v) for v in indexer.cached_files_by_category.values())
+        logger.info(f"[SmartModelResolver] Local disk cache refreshed: {total_models} models re-indexed.")
+
+        return web.json_response({
+            "success": True,
+            "total_models": total_models,
+            "categories": len(indexer.cached_files_by_category)
+        })
+    except Exception as e:
+        logger.error(f"[SmartModelResolver] Refresh cache error: {e}", exc_info=True)
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
 if hasattr(PromptServer, "instance") and PromptServer.instance is not None:
     PromptServer.instance.routes.post("/smart_model_resolver/resolve_batch")(_handle_resolve_batch_impl)
+    PromptServer.instance.routes.post("/smart_model_resolver/refresh_cache")(_handle_refresh_cache_impl)
 
-logger.info("★ ComfyUI-SmartModelResolver ready (Subfolder Auto-Fix + Interactive Model Suggestions)")
+logger.info("★ ComfyUI-SmartModelResolver ready (Subfolder Auto-Fix + Interactive Model Suggestions + Live Cache Refresh)")
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]

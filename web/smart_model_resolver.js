@@ -244,6 +244,28 @@ app.registerExtension({
                 background: rgba(0, 240, 210, 0.22);
                 border-color: #00f0d2;
             }
+            .smr-rescan-btn {
+                background: rgba(0, 240, 210, 0.12);
+                border: 1px solid rgba(0, 240, 210, 0.4);
+                color: #4efce5;
+                border-radius: 6px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: 600;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                transition: all 0.15s;
+            }
+            .smr-rescan-btn:hover {
+                background: rgba(0, 240, 210, 0.25);
+                border-color: #00f0d2;
+            }
+            .smr-rescan-btn:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+            }
         `;
         document.head.appendChild(style);
 
@@ -260,6 +282,28 @@ app.registerExtension({
         let scanDebounceTimer = null;
         let lastNotifiedSignature = "";
 
+        // Helper: Official ComfyUI Desktop & Web Frontend Cache Refresh
+        async function refreshComfyUIFrontendState() {
+            try {
+                if (typeof app.reloadNodeDefs === "function") {
+                    await app.reloadNodeDefs();
+                } else if (typeof app.refreshComboInNodes === "function") {
+                    await app.refreshComboInNodes();
+                }
+            } catch (e) {
+                console.warn("[SmartModelResolver] Node defs reload:", e);
+            }
+            try {
+                if (typeof app.refreshMissingModels === "function") {
+                    await app.refreshMissingModels({ silent: true });
+                }
+            } catch (e) {
+                console.warn("[SmartModelResolver] Missing models refresh:", e);
+            }
+            if (app.graph) app.graph.setDirtyCanvas(true, true);
+            if (app.canvas) app.canvas.draw(true, true);
+        }
+
         // Toolbar menu button
         const menu = document.querySelector(".comfy-menu");
         if (menu) {
@@ -267,9 +311,13 @@ app.registerExtension({
             btn.className = "smr-toolbar-btn";
             btn.innerHTML = "🔍 Resolve Models";
             btn.title = "Smart Model Resolver: Scan canvas and subgraphs for local subfolders and suggested matches.";
-            btn.onclick = () => {
+            btn.onclick = async () => {
                 sessionIgnoredKeys.clear();
                 lastNotifiedSignature = "";
+                try {
+                    await api.fetchApi("/smart_model_resolver/refresh_cache", { method: "POST" });
+                    await refreshComfyUIFrontendState();
+                } catch (e) {}
                 window.SmartModelResolver_ScanAndFix(true);
             };
             menu.appendChild(btn);
@@ -301,86 +349,177 @@ app.registerExtension({
             }
         };
 
-        // Recursively traverse all nodes across root graph and all Subgraphs.
-        // Returns ONLY leaf nodes (actual processing nodes) with parentSubgraphNode reference.
-        // Outer Subgraph wrapper nodes are recursed into, not returned directly, to eliminate duplicate widgets.
+        // Helper: Find a node by ID anywhere in graph hierarchy (including inside subgraphs)
+        function findNodeAnywhere(graph, targetId) {
+            if (!graph) return null;
+            const targetStr = String(targetId);
+            const nodes = graph._nodes || graph.nodes || [];
+            for (const n of nodes) {
+                if (String(n.id) === targetStr) return n;
+                if (n.subgraph) {
+                    const inner = findNodeAnywhere(n.subgraph, targetId);
+                    if (inner) return inner;
+                }
+            }
+            return null;
+        }
+
+        // Recursively traverse all nodes across root graph and all Subgraphs / GroupNodes.
+        // Returns all active nodes with their full parent hierarchy chain.
         function collectAllGraphNodes(rootGraph) {
             const result = [];
-            function traverse(graph, parentSubgraphNode = null) {
+            const seenKeys = new Set();
+
+            function traverse(graph, parentChain = []) {
                 if (!graph) return;
                 const nodes = graph._nodes || graph.nodes || [];
                 for (const node of nodes) {
-                    if (node.isSubgraphNode?.() && node.subgraph) {
-                        // Subgraph wrapper node: traverse into its inner graph
-                        traverse(node.subgraph, node);
-                    } else {
-                        // Leaf node
-                        result.push({ node, graph, parentSubgraphNode });
+                    const isSub = (typeof node.isSubgraphNode === "function" ? node.isSubgraphNode() : !!node.isSubgraphNode) || !!node.subgraph;
+                    const key = `${parentChain.map(p => p.id).join("/")}#${node.id}`;
+                    if (!seenKeys.has(key)) {
+                        seenKeys.add(key);
+                        result.push({ node, graph, parentChain });
+                    }
+                    if (isSub && node.subgraph) {
+                        traverse(node.subgraph, [...parentChain, node]);
                     }
                 }
             }
-            traverse(rootGraph);
+            traverse(rootGraph, []);
             return result;
         }
 
-        // Apply a single widget update cleanly across leaf node & parent subgraph wrapper
+        // Apply a single widget update cleanly across leaf node & parent subgraph wrappers
         function applyWidgetUpdate(allNodeEntries, nodeId, widgetName, newValue) {
-            const entry = allNodeEntries.find(e => e.node.id === nodeId);
-            if (!entry) return;
+            const targetIdStr = String(nodeId);
+            let entry = allNodeEntries ? allNodeEntries.find(e => String(e.node.id) === targetIdStr) : null;
+            let node = entry ? entry.node : findNodeAnywhere(app.graph, nodeId);
+            if (!node) {
+                console.warn(`[SmartModelResolver] Node #${nodeId} could not be found.`);
+                return false;
+            }
 
-            const { node, parentSubgraphNode } = entry;
-            const w = node.widgets?.find(x => x.name === widgetName);
+            const parentChain = entry ? (entry.parentChain || []) : [];
+            const w = (node.widgets && node.widgets.find(x => x.name === widgetName)) ||
+                      (node.widgets && node.widgets.find(x => typeof x.value === "string" && (x.value.includes("/") || x.value.includes("\\"))));
+            if (!w) {
+                console.warn(`[SmartModelResolver] Widget "${widgetName}" not found on node #${nodeId}.`);
+                return false;
+            }
 
-            if (w) {
-                // Determine exact string format from available options (e.g. Windows backslash vs Unix slash)
-                let exactValue = newValue;
-                let availableValues = [];
-                if (w.options) {
-                    if (Array.isArray(w.options.values)) availableValues = w.options.values;
-                    else if (typeof w.options.values === "function") {
-                        try {
-                            const res = w.options.values(w, node);
-                            if (Array.isArray(res)) availableValues = res;
-                        } catch (e) {}
+            // 1. Determine exact string format from available options (e.g. Windows backslash vs Unix slash)
+            let exactValue = newValue;
+            let availableValues = [];
+            if (w.options) {
+                if (Array.isArray(w.options.values)) availableValues = w.options.values;
+                else if (typeof w.options.values === "function") {
+                    try {
+                        const res = w.options.values(w, node);
+                        if (Array.isArray(res)) availableValues = res;
+                    } catch (e) {}
+                }
+            }
+            if (availableValues.length > 0) {
+                const normTarget = String(newValue).replace(/\\/g, "/").toLowerCase();
+                const match = availableValues.find(opt => String(opt).replace(/\\/g, "/").toLowerCase() === normTarget);
+                if (match) exactValue = match;
+            }
+
+            // Ensure w.options.values contains BOTH slash variants so LiteGraph & ComfyUI Desktop allow it
+            if (w.options && Array.isArray(w.options.values)) {
+                const valUnix = String(exactValue).replace(/\\/g, "/");
+                const valWin = String(exactValue).replace(/\//g, "\\");
+                if (!w.options.values.includes(exactValue)) w.options.values.push(exactValue);
+                if (!w.options.values.includes(valUnix)) w.options.values.push(valUnix);
+                if (!w.options.values.includes(valWin)) w.options.values.push(valWin);
+            }
+
+            const oldVal = w.value;
+            w.value = exactValue;
+
+            // 2. Update node.widgets_values array/object (CRUCIAL for graphToPrompt serialization!)
+            if (node.widgets) {
+                const rawIdx = node.widgets.indexOf(w);
+                const serializableWidgets = node.widgets.filter(rw => rw.name && rw.options?.serialize !== false);
+                const sIdx = serializableWidgets.indexOf(w);
+
+                if (Array.isArray(node.widgets_values)) {
+                    if (sIdx >= 0 && sIdx < node.widgets_values.length) {
+                        node.widgets_values[sIdx] = exactValue;
                     }
+                    if (rawIdx >= 0 && rawIdx < node.widgets_values.length) {
+                        node.widgets_values[rawIdx] = exactValue;
+                    }
+                } else if (node.widgets_values && typeof node.widgets_values === "object") {
+                    node.widgets_values[w.name] = exactValue;
                 }
-                if (availableValues.length > 0) {
-                    const normTarget = String(newValue).replace(/\\/g, "/").toLowerCase();
-                    const match = availableValues.find(opt => String(opt).replace(/\\/g, "/").toLowerCase() === normTarget);
-                    if (match) exactValue = match;
-                }
+            }
+            if (node.widgets_values_named && typeof node.widgets_values_named === "object") {
+                node.widgets_values_named[w.name] = exactValue;
+            }
 
-                const oldVal = w.value;
-                w.value = exactValue;
-                if (w.callback) {
-                    try { w.callback(w.value); } catch (e) {}
-                }
-                if (node.onWidgetChanged) {
-                    try { node.onWidgetChanged(w.name, w.value, oldVal, w); } catch (e) {}
-                }
-                if (node.has_errors) {
-                    node.has_errors = false;
-                    delete node.errors;
-                }
+            // 3. Fire callbacks & reset error state
+            if (w.callback) {
+                try { w.callback(w.value); } catch (e) {}
+            }
+            if (node.onWidgetChanged) {
+                try { node.onWidgetChanged(w.name, w.value, oldVal, w); } catch (e) {}
+            }
+            if (node.has_errors) {
+                node.has_errors = false;
+                delete node.errors;
+            }
+            if (typeof node.setDirtyCanvas === "function") {
                 node.setDirtyCanvas(true, true);
+            }
 
-                // If this widget was promoted to the parent Subgraph node, sync it as well
-                if (parentSubgraphNode && parentSubgraphNode.widgets) {
-                    for (const pw of parentSubgraphNode.widgets) {
-                        if (pw.name === w.name || pw.value === oldVal) {
-                            pw.value = exactValue;
-                            if (pw.callback) {
-                                try { pw.callback(pw.value); } catch (e) {}
+            // 4. Update parent Subgraph / GroupNode promoted inputs and widgets across full parentChain
+            for (const parentNode of parentChain) {
+                if (!parentNode || !parentNode.widgets) continue;
+                for (const pw of parentNode.widgets) {
+                    const pwNorm = String(pw.value).replace(/\\/g, "/").toLowerCase();
+                    const oldNorm = String(oldVal).replace(/\\/g, "/").toLowerCase();
+                    if (pw.name === w.name || pw.value === oldVal || pwNorm === oldNorm) {
+                        if (pw.options && Array.isArray(pw.options.values)) {
+                            const valUnix = String(exactValue).replace(/\\/g, "/");
+                            const valWin = String(exactValue).replace(/\//g, "\\");
+                            if (!pw.options.values.includes(exactValue)) pw.options.values.push(exactValue);
+                            if (!pw.options.values.includes(valUnix)) pw.options.values.push(valUnix);
+                            if (!pw.options.values.includes(valWin)) pw.options.values.push(valWin);
+                        }
+                        const pOldVal = pw.value;
+                        pw.value = exactValue;
+
+                        const pwIdx = parentNode.widgets.indexOf(pw);
+                        if (Array.isArray(parentNode.widgets_values)) {
+                            if (pwIdx >= 0 && pwIdx < parentNode.widgets_values.length) {
+                                parentNode.widgets_values[pwIdx] = exactValue;
                             }
-                            if (parentSubgraphNode.has_errors) {
-                                parentSubgraphNode.has_errors = false;
-                                delete parentSubgraphNode.errors;
-                            }
-                            parentSubgraphNode.setDirtyCanvas(true, true);
+                        } else if (parentNode.widgets_values && typeof parentNode.widgets_values === "object") {
+                            parentNode.widgets_values[pw.name] = exactValue;
+                        }
+                        if (parentNode.widgets_values_named) {
+                            parentNode.widgets_values_named[pw.name] = exactValue;
+                        }
+
+                        if (pw.callback) {
+                            try { pw.callback(pw.value); } catch (e) {}
+                        }
+                        if (parentNode.onWidgetChanged) {
+                            try { parentNode.onWidgetChanged(pw.name, pw.value, pOldVal, pw); } catch (e) {}
+                        }
+                        if (parentNode.has_errors) {
+                            parentNode.has_errors = false;
+                            delete parentNode.errors;
+                        }
+                        if (typeof parentNode.setDirtyCanvas === "function") {
+                            parentNode.setDirtyCanvas(true, true);
                         }
                     }
                 }
             }
+
+            return true;
         }
 
         // Consolidated Dialog: Shows ALL exact and similar models in ONE unified card
@@ -500,9 +639,14 @@ app.registerExtension({
 
             card.innerHTML = `
                 <div class="smr-card-header">
-                    <span class="smr-card-title">💡 Smart Model Resolver</span>
-                    <span class="smr-badge">${totalCount} Model${totalCount > 1 ? 's' : ''}</span>
-                    <button class="smr-close-btn" id="smr-close-modal" title="Dismiss">✕</button>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span class="smr-card-title">💡 Smart Model Resolver</span>
+                        <span class="smr-badge">${totalCount} Model${totalCount > 1 ? 's' : ''}</span>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                        <button class="smr-rescan-btn" id="smr-rescan-drive-btn" title="Refresh local ComfyUI cache and rescan model directories">🔄 Rescan Local Drive</button>
+                        <button class="smr-close-btn" id="smr-close-modal" title="Dismiss">✕</button>
+                    </div>
                 </div>
                 <div class="smr-card-body">
                     <div style="color: #94a3b8; font-size: 11.5px;">
@@ -550,6 +694,30 @@ app.registerExtension({
             card.querySelector("#smr-close-modal").onclick = dismissAll;
             card.querySelector("#smr-dismiss-all").onclick = dismissAll;
 
+            const rescanBtn = card.querySelector("#smr-rescan-drive-btn");
+            if (rescanBtn) {
+                rescanBtn.onclick = async () => {
+                    rescanBtn.disabled = true;
+                    rescanBtn.textContent = "🔄 Rescanning...";
+                    try {
+                        const resp = await api.fetchApi("/smart_model_resolver/refresh_cache", { method: "POST" });
+                        const data = await resp.json();
+                        await refreshComfyUIFrontendState();
+                        card.remove();
+                        window.SmartModelResolver_Notify("Drive Rescanned", `Refreshed ComfyUI cache (${data.total_models || 0} models found). Re-evaluating workflow...`, 2500);
+                        sessionIgnoredKeys.clear();
+                        lastNotifiedSignature = "";
+                        setTimeout(() => {
+                            window.SmartModelResolver_ScanAndFix(true);
+                        }, 250);
+                    } catch (e) {
+                        console.error("[SmartModelResolver] Rescan error:", e);
+                        rescanBtn.disabled = false;
+                        rescanBtn.textContent = "🔄 Rescan Local Drive";
+                    }
+                };
+            }
+
             // Batch Replace handler
             replaceBtn.onclick = async () => {
                 isApplyingBatch = true;
@@ -586,9 +754,8 @@ app.registerExtension({
                         curIdx++;
                     }
 
-                    // Redraw canvas
-                    if (app.graph) app.graph.setDirtyCanvas(true, true);
-                    if (app.canvas) app.canvas.draw(true, true);
+                    // Refresh ComfyUI Desktop & Web node defs and missing model stores
+                    await refreshComfyUIFrontendState();
 
                     card.remove();
 
@@ -609,6 +776,9 @@ app.registerExtension({
             };
         }
 
+        // Whitelist of valid model extensions (including .gguf for modern ComfyUI workflows)
+        const VALID_MODEL_EXTS = [".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".sft", ".onnx", ".gguf"];
+
         // Core Scan & Resolve Logic
         window.SmartModelResolver_ScanAndFix = async (manualTrigger = false) => {
             if (!app.graph || isScanning || isApplyingBatch) return;
@@ -618,20 +788,13 @@ app.registerExtension({
                 const allNodeEntries = collectAllGraphNodes(app.graph);
                 const missingEntries = [];
 
-                for (const { node, parentSubgraphNode } of allNodeEntries) {
+                for (const { node, parentChain } of allNodeEntries) {
                     if (!node.widgets) continue;
                     for (const w of node.widgets) {
                         const rawVal = w.value;
                         if (typeof rawVal !== "string") continue;
                         const val = rawVal.trim();
                         if (!val) continue;
-
-                        const lowerVal = val.toLowerCase();
-                        const isModel = lowerVal.endsWith(".safetensors") || lowerVal.endsWith(".ckpt") ||
-                                        lowerVal.endsWith(".pt") || lowerVal.endsWith(".pth") ||
-                                        lowerVal.endsWith(".bin") || lowerVal.endsWith(".sft") ||
-                                        lowerVal.endsWith(".onnx");
-                        if (!isModel) continue;
 
                         // Retrieve available options
                         let availableValues = [];
@@ -645,6 +808,14 @@ app.registerExtension({
                                 } catch (e) {}
                             }
                         }
+
+                        const lowerVal = val.toLowerCase();
+                        const isModelExt = VALID_MODEL_EXTS.some(ext => lowerVal.endsWith(ext));
+                        const isModelOptions = Array.isArray(availableValues) && availableValues.length > 0 &&
+                            availableValues.some(opt => typeof opt === "string" && VALID_MODEL_EXTS.some(ext => opt.toLowerCase().endsWith(ext)));
+                        const isModelName = /ckpt|checkpoint|model|lora|vae|clip|unet|diffusion|controlnet|upscale/i.test(w.name || "");
+
+                        if (!isModelExt && !isModelOptions && !isModelName) continue;
 
                         const normVal = val.replace(/\\/g, "/").toLowerCase();
 
@@ -675,15 +846,15 @@ app.registerExtension({
                         }
 
                         let displayTitle = node.title || node.type || `Node #${node.id}`;
-                        if (parentSubgraphNode) {
-                            const pTitle = parentSubgraphNode.title || parentSubgraphNode.type || "Group";
-                            displayTitle = `${pTitle} ➔ ${displayTitle}`;
+                        if (parentChain && parentChain.length > 0) {
+                            const chainStr = parentChain.map(p => p.title || p.type || `Group #${p.id}`).join(" ➔ ");
+                            displayTitle = `${chainStr} ➔ ${displayTitle}`;
                         }
 
                         missingEntries.push({
                             nodeId: node.id,
                             nodeTitle: displayTitle,
-                            parentSubgraphId: parentSubgraphNode ? parentSubgraphNode.id : null,
+                            parentSubgraphId: parentChain && parentChain.length > 0 ? parentChain[parentChain.length - 1].id : null,
                             widgetName: w.name,
                             currentValue: val,
                             availableValues: availableValues

@@ -10,14 +10,14 @@ logger = logging.getLogger("SmartModelResolver")
 
 # Strict set of valid model file extensions (NEVER match .py, .json, etc.)
 VALID_MODEL_EXTENSIONS: Set[str] = {
-    '.safetensors', '.ckpt', '.pt', '.pth', '.bin', '.sft', '.onnx'
+    '.safetensors', '.ckpt', '.pt', '.pth', '.bin', '.sft', '.onnx', '.gguf'
 }
 
 # Generic technical suffix tokens that should not count as model family identity
 GENERIC_SUFFIX_TOKENS: Set[str] = {
     'int8', 'int4', 'int2', 'fp8', 'fp16', 'bf16', 'fp32', 'f32', 'f16', 'fp4',
     'convrot', 'scaled', 'pruned', 'unpruned', 'safetensors', 'ckpt', 'pt',
-    'pth', 'bin', 'sft', 'onnx', 'e4m3fn', 'e5m2', 'emaonly', 'nonema', 'diffusers',
+    'pth', 'bin', 'sft', 'onnx', 'gguf', 'e4m3fn', 'e5m2', 'emaonly', 'nonema', 'diffusers',
     'awq', 'nvfp4', 'mixed', 'comfy', 'comfyui'
 }
 
@@ -28,7 +28,7 @@ KNOWN_MODEL_FAMILIES = [
 ]
 
 def extract_semantic_features(name: str) -> dict:
-    name_clean = re.sub(r'\.(safetensors|ckpt|pt|pth|bin|sft|onnx)$', '', name.lower())
+    name_clean = re.sub(r'\.(safetensors|ckpt|pt|pth|bin|sft|onnx|gguf)$', '', name.lower())
     raw_tokens = re.split(r'[-_.\s/]+', name_clean)
     tokens = [t for t in raw_tokens if t]
 
@@ -123,32 +123,56 @@ class SmartModelIndex:
                 new_cached_files: Dict[str, List[str]] = {}
                 new_basename_to_paths: Dict[str, List[Tuple[str, str]]] = {}
 
-                all_cats = list(getattr(folder_paths, "folder_names_and_paths", {}).keys())
-                for cat in all_cats:
-                    try:
-                        files = folder_paths.get_filename_list(cat)
-                    except Exception:
-                        continue
-
+                folder_map = getattr(folder_paths, "folder_names_and_paths", {})
+                for cat, (dirs, exts) in folder_map.items():
                     cat_list = []
-                    for rel_p in files:
-                        ext = os.path.splitext(rel_p)[-1].lower()
-                        if ext not in VALID_MODEL_EXTENSIONS:
-                            continue
-                        norm_rel = rel_p.replace("\\", "/")
-                        cat_list.append(norm_rel)
-                        base_lower = os.path.basename(norm_rel).lower()
-                        if base_lower not in new_basename_to_paths:
-                            new_basename_to_paths[base_lower] = []
-                        new_basename_to_paths[base_lower].append((cat, norm_rel))
+                    seen_rel = set()
 
-                    new_cached_files[cat] = cat_list
+                    # 1. Physical directory scan with os.walk
+                    for d in dirs:
+                        if not os.path.isdir(d):
+                            continue
+                        for root, subdirs, filenames in os.walk(d, followlinks=True):
+                            subdirs[:] = [sd for sd in subdirs if sd != ".git" and not sd.startswith(".")]
+                            for fn in filenames:
+                                ext = os.path.splitext(fn)[-1].lower()
+                                if ext in VALID_MODEL_EXTENSIONS:
+                                    try:
+                                        rel_p = os.path.relpath(os.path.join(root, fn), d).replace("\\", "/")
+                                        if rel_p not in seen_rel:
+                                            seen_rel.add(rel_p)
+                                            cat_list.append(rel_p)
+                                            base_lower = fn.lower()
+                                            if base_lower not in new_basename_to_paths:
+                                                new_basename_to_paths[base_lower] = []
+                                            new_basename_to_paths[base_lower].append((cat, rel_p))
+                                    except Exception:
+                                        continue
+
+                    # 2. Also incorporate any files returned by folder_paths.get_filename_list(cat)
+                    try:
+                        comfy_files = folder_paths.get_filename_list(cat)
+                        for rel_p in comfy_files:
+                            ext = os.path.splitext(rel_p)[-1].lower()
+                            if ext in VALID_MODEL_EXTENSIONS:
+                                norm_rel = rel_p.replace("\\", "/")
+                                if norm_rel not in seen_rel:
+                                    seen_rel.add(norm_rel)
+                                    cat_list.append(norm_rel)
+                                    base_lower = os.path.basename(norm_rel).lower()
+                                    if base_lower not in new_basename_to_paths:
+                                        new_basename_to_paths[base_lower] = []
+                                    new_basename_to_paths[base_lower].append((cat, norm_rel))
+                    except Exception:
+                        pass
+
+                    new_cached_files[cat] = sorted(cat_list)
 
                 self.cached_files_by_category = new_cached_files
                 self.basename_to_paths = new_basename_to_paths
                 self.last_scan_time = time.time()
                 total_count = sum(len(v) for v in new_cached_files.values())
-                logger.info(f"[SmartModelResolver] Fast-indexed {total_count} models across {len(new_cached_files)} categories in {time.time()-t0:.3f}s")
+                logger.info(f"[SmartModelResolver] Physical disk indexed {total_count} models across {len(new_cached_files)} categories in {time.time()-t0:.3f}s")
             except Exception as e:
                 logger.error(f"[SmartModelResolver] Error during indexing: {e}")
 
@@ -171,12 +195,22 @@ class SmartModelIndex:
         folder_name = folder_paths.map_legacy(folder_name)
 
         def _resolve_full(cat: str, rel: str) -> Optional[str]:
+            cat = folder_paths.map_legacy(cat) if hasattr(folder_paths, "map_legacy") else cat
             try:
                 p = folder_paths.get_full_path(cat, rel)
                 if p and (os.path.isfile(p) or os.path.islink(p)):
                     return p
             except Exception:
                 pass
+            # Physical disk fallback
+            folder_map = getattr(folder_paths, "folder_names_and_paths", {})
+            if cat in folder_map:
+                dirs, _ = folder_map[cat]
+                clean_rel = rel.replace("/", os.sep).replace("\\", os.sep)
+                for d in dirs:
+                    cand = os.path.join(d, clean_rel)
+                    if os.path.isfile(cand) or os.path.islink(cand):
+                        return cand
             return None
 
         # 1. Exact basename match
