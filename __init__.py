@@ -1,4 +1,6 @@
 import os
+import re
+import difflib
 import threading
 import logging
 from aiohttp import web
@@ -67,23 +69,26 @@ async def _handle_resolve_batch_impl(request):
 
             clean_val = current_val.strip().replace("\\", "/")
             req_base = os.path.basename(clean_val).lower()
-            req_ext = os.path.splitext(req_base)[-1].lower()
+            req_stem, req_ext = os.path.splitext(req_base)
 
             # Strictly ignore non-model files (e.g. .py, .json)
             if req_ext and req_ext not in VALID_MODEL_EXTENSIONS:
                 continue
 
-            w_lower = widget_name.lower()
-            if "lora" in w_lower:
+            # Contextual category detection from both widget name and node title
+            context = f"{widget_name} {node_title}".lower()
+            if "lora" in context:
                 cat_hint = "loras"
-            elif "unet" in w_lower or "diffusion" in w_lower:
+            elif "unet" in context or "diffusion" in context:
                 cat_hint = "diffusion_models"
-            elif "vae" in w_lower:
+            elif "vae" in context:
                 cat_hint = "vae"
-            elif "clip" in w_lower or "text_encoder" in w_lower or "conditioning" in w_lower:
+            elif "clip" in context or "text_encoder" in context or "conditioning" in context or "t5" in context:
                 cat_hint = "text_encoders"
-            elif "controlnet" in w_lower:
+            elif "controlnet" in context:
                 cat_hint = "controlnet"
+            elif "upscale" in context:
+                cat_hint = "upscale_models"
             else:
                 cat_hint = "checkpoints"
 
@@ -122,24 +127,50 @@ async def _handle_resolve_batch_impl(request):
                     "matchType": match_type
                 })
             elif not matched_val:
-                # 3. Model is NOT found on disk. Look for an authentic SIMILAR model to suggest to user!
-                sim_res = indexer.find_similar_model(cat_hint, current_val, folder_paths)
-                if sim_res:
-                    full_p, rel_p, score = sim_res
-                    cand_base = os.path.basename(rel_p).lower()
-                    final_cand = rel_p
-                    for opt in available_vals:
-                        if os.path.basename(opt.replace("\\", "/")).lower() == cand_base:
-                            final_cand = opt
-                            break
+                # 3. Model is NOT found on disk. Look for an authentic SIMILAR model to suggest!
+                best_sim_cand = None
+                best_sim_score = 0.0
 
+                clean_req_tokens = set(re.findall(r'[a-zA-Z0-9]+', req_stem))
+
+                # Prioritize available options for this exact widget first
+                for opt in available_vals:
+                    opt_norm = opt.replace("\\", "/")
+                    opt_base = os.path.basename(opt_norm).lower()
+                    opt_s, opt_e = os.path.splitext(opt_base)
+                    if opt_e not in VALID_MODEL_EXTENSIONS or opt_base == req_base:
+                        continue
+                    opt_tokens = set(re.findall(r'[a-zA-Z0-9]+', opt_s))
+                    common = clean_req_tokens.intersection(opt_tokens)
+                    if len(common) < 2 and not (req_stem[:6] == opt_s[:6] and len(req_stem) > 6):
+                        continue
+                    score = difflib.SequenceMatcher(None, req_stem, opt_s).ratio()
+                    if score > best_sim_score:
+                        best_sim_score = score
+                        best_sim_cand = opt
+
+                # Fallback to indexing category on disk
+                if not best_sim_cand or best_sim_score < 0.65:
+                    sim_res = indexer.find_similar_model(cat_hint, current_val, folder_paths)
+                    if sim_res:
+                        full_p, rel_p, score = sim_res
+                        if score > best_sim_score:
+                            best_sim_score = score
+                            cand_base = os.path.basename(rel_p).lower()
+                            best_sim_cand = rel_p
+                            for opt in available_vals:
+                                if os.path.basename(opt.replace("\\", "/")).lower() == cand_base:
+                                    best_sim_cand = opt
+                                    break
+
+                if best_sim_cand and best_sim_score >= 0.65:
                     suggestions.append({
                         "nodeId": node_id,
                         "nodeTitle": node_title,
                         "widgetName": widget_name,
                         "requestedModel": current_val,
-                        "suggestedModel": final_cand,
-                        "similarityScore": round(score * 100)
+                        "suggestedModel": best_sim_cand,
+                        "similarityScore": round(best_sim_score * 100)
                     })
 
         return web.json_response({
