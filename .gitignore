@@ -21,3 +21,9 @@ env/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Packaging & Archives
+node.zip
+*.zip
+*.tar.gz
+
