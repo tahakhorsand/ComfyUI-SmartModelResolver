@@ -332,13 +332,35 @@ app.registerExtension({
             const w = node.widgets?.find(x => x.name === widgetName);
 
             if (w) {
+                // Determine exact string format from available options (e.g. Windows backslash vs Unix slash)
+                let exactValue = newValue;
+                let availableValues = [];
+                if (w.options) {
+                    if (Array.isArray(w.options.values)) availableValues = w.options.values;
+                    else if (typeof w.options.values === "function") {
+                        try {
+                            const res = w.options.values(w, node);
+                            if (Array.isArray(res)) availableValues = res;
+                        } catch (e) {}
+                    }
+                }
+                if (availableValues.length > 0) {
+                    const normTarget = String(newValue).replace(/\\/g, "/").toLowerCase();
+                    const match = availableValues.find(opt => String(opt).replace(/\\/g, "/").toLowerCase() === normTarget);
+                    if (match) exactValue = match;
+                }
+
                 const oldVal = w.value;
-                w.value = newValue;
+                w.value = exactValue;
                 if (w.callback) {
                     try { w.callback(w.value); } catch (e) {}
                 }
                 if (node.onWidgetChanged) {
                     try { node.onWidgetChanged(w.name, w.value, oldVal, w); } catch (e) {}
+                }
+                if (node.has_errors) {
+                    node.has_errors = false;
+                    delete node.errors;
                 }
                 node.setDirtyCanvas(true, true);
 
@@ -346,9 +368,13 @@ app.registerExtension({
                 if (parentSubgraphNode && parentSubgraphNode.widgets) {
                     for (const pw of parentSubgraphNode.widgets) {
                         if (pw.name === w.name || pw.value === oldVal) {
-                            pw.value = newValue;
+                            pw.value = exactValue;
                             if (pw.callback) {
                                 try { pw.callback(pw.value); } catch (e) {}
+                            }
+                            if (parentSubgraphNode.has_errors) {
+                                parentSubgraphNode.has_errors = false;
+                                delete parentSubgraphNode.errors;
                             }
                             parentSubgraphNode.setDirtyCanvas(true, true);
                         }
@@ -624,13 +650,21 @@ app.registerExtension({
 
                         // If availableValues has items, check if current value is present
                         if (availableValues.length > 0) {
-                            const exists = availableValues.some(opt => {
+                            const exactOpt = availableValues.find(opt => opt === val);
+                            if (exactOpt) {
+                                continue;
+                            }
+
+                            // If not an exact match, check for slash or casing mismatch
+                            const slashMismatchOpt = availableValues.find(opt => {
                                 const normOpt = String(opt).replace(/\\/g, "/").toLowerCase();
                                 return normOpt === normVal;
                             });
 
-                            if (exists) {
-                                // Model is already present and fully valid
+                            if (slashMismatchOpt) {
+                                // Silent Auto-Alignment: file exists physically, but has slash or casing difference!
+                                console.log(`[SmartModelResolver] Auto-aligning slash format for node ${node.id} (${w.name}): "${val}" -> "${slashMismatchOpt}"`);
+                                applyWidgetUpdate(allNodeEntries, node.id, w.name, slashMismatchOpt);
                                 continue;
                             }
                         }

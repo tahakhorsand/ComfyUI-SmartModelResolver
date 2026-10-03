@@ -39,6 +39,74 @@ def smart_get_full_path(folder_name: str, filename: str):
 
 folder_paths.get_full_path = smart_get_full_path
 
+# Hook execution.validate_prompt to auto-align slash formats and subfolder paths at runtime
+try:
+    import execution
+    import nodes
+
+    _orig_validate_prompt = execution.validate_prompt
+
+    async def smart_validate_prompt(prompt_id, prompt, partial_execution_list=None):
+        if prompt and isinstance(prompt, dict):
+            for node_id, node_data in prompt.items():
+                if not isinstance(node_data, dict):
+                    continue
+                inputs = node_data.get("inputs")
+                class_type = node_data.get("class_type")
+                if not isinstance(inputs, dict) or not class_type:
+                    continue
+                class_def = nodes.NODE_CLASS_MAPPINGS.get(class_type)
+                if not class_def:
+                    continue
+                try:
+                    class_inputs = class_def.INPUT_TYPES()
+                except Exception:
+                    continue
+                valid_inputs = set(class_inputs.get("required", {})).union(set(class_inputs.get("optional", {})))
+                for input_name in valid_inputs:
+                    if input_name not in inputs:
+                        continue
+                    val = inputs[input_name]
+                    if not isinstance(val, str):
+                        continue
+                    info = class_inputs.get("required", {}).get(input_name) or class_inputs.get("optional", {}).get(input_name)
+                    if not info:
+                        continue
+                    combo_options = info[0] if isinstance(info, tuple) and isinstance(info[0], list) else None
+                    if not combo_options:
+                        continue
+                    if val in combo_options:
+                        continue
+
+                    # 1. Slash-normalized match (e.g. '/' vs '\')
+                    norm_val = val.replace("/", "\\").lower()
+                    matched = False
+                    for opt in combo_options:
+                        if not isinstance(opt, str):
+                            continue
+                        if opt.replace("/", "\\").lower() == norm_val:
+                            inputs[input_name] = opt
+                            logger.info(f"[SmartModelResolver] Auto-aligned combo input '{input_name}' for node {node_id}: '{val}' -> '{opt}'")
+                            matched = True
+                            break
+
+                    # 2. Subfolder auto-location if basename matches
+                    if not matched:
+                        req_base = os.path.basename(val.replace("/", "\\")).lower()
+                        for opt in combo_options:
+                            if not isinstance(opt, str):
+                                continue
+                            if os.path.basename(opt.replace("/", "\\")).lower() == req_base:
+                                inputs[input_name] = opt
+                                logger.info(f"[SmartModelResolver] Auto-located subfolder combo input '{input_name}' for node {node_id}: '{val}' -> '{opt}'")
+                                break
+
+        return await _orig_validate_prompt(prompt_id, prompt, partial_execution_list)
+
+    execution.validate_prompt = smart_validate_prompt
+except Exception as e:
+    logger.debug(f"[SmartModelResolver] Could not hook execution.validate_prompt: {e}")
+
 # Pre-index in background daemon thread on startup so ComfyUI starts instantly
 def _warmup_indexer():
     try:
