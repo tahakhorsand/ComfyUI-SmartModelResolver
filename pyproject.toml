@@ -3,10 +3,17 @@ name = "comfyui-smartmodelresolver"
 description = "Intelligent subfolder auto-linker and model replacement suggestion assistant for ComfyUI."
 version = "1.0.0"
 license = { text = "MIT" }
-authors = [{ name = "ComfyUI Community" }]
+authors = [{ name = "Taha Khorsand" }]
 keywords = ["comfyui", "custom-nodes", "model-resolver", "subfolders", "workflow-fixer"]
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com"
-Repository = "https://github.com"
+Homepage = "https://github.com/tahakhorsand/ComfyUI-SmartModelResolver"
+Repository = "https://github.com/tahakhorsand/ComfyUI-SmartModelResolver"
+Issues = "https://github.com/tahakhorsand/ComfyUI-SmartModelResolver/issues"
+
+[tool.comfy]
+PublisherId = "tahakhorsand"
+DisplayName = "ComfyUI-SmartModelResolver"
+Icon = ""
+
