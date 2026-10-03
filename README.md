@@ -23,7 +23,6 @@ Eliminates workflow loading failures, missing subfolder paths, and red widget er
 
 1. Open a terminal inside your ComfyUI `custom_nodes` directory:
    ```bash
-   
    git clone https://github.com/tahakhorsand/ComfyUI-SmartModelResolver
    ```
 2. Restart ComfyUI.
