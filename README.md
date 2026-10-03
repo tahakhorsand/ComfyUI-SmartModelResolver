@@ -69,7 +69,4 @@ Selected paths are instantly mapped directly to your graph and subgraphs without
 ## 📄 License
 This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
 
-- ✅ **Free & Open Source**: Anyone is free to use, run, modify, and distribute this software free of charge.
-- 👤 **Attribution Required**: Copyright and original author attribution (Taha Khorsand) must be retained in all copies.
-- 🔄 **Copyleft / Share-Alike**: Any modifications or derivative works must also be distributed openly under the same GPL-3.0 license. Closed-source or proprietary distribution is strictly prohibited.
 
