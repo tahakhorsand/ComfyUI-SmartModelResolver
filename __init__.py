@@ -48,6 +48,28 @@ def _warmup_indexer():
 
 threading.Thread(target=_warmup_indexer, daemon=True).start()
 
+def check_file_physically_exists(folder_paths, cat: str, filename: str) -> bool:
+    if not filename:
+        return False
+    cat = folder_paths.map_legacy(cat) if hasattr(folder_paths, "map_legacy") else cat
+    folder_map = getattr(folder_paths, "folder_names_and_paths", {})
+    if cat not in folder_map:
+        return False
+    dirs, _ = folder_map[cat]
+    clean_fn = filename.replace("/", os.sep).replace("\\", os.sep).lstrip(os.sep)
+    for d in dirs:
+        full_p = os.path.join(d, clean_fn)
+        if os.path.isfile(full_p) or os.path.islink(full_p):
+            return True
+    return False
+
+def check_file_exists_any_category(folder_paths, filename: str) -> bool:
+    folder_map = getattr(folder_paths, "folder_names_and_paths", {})
+    for cat in folder_map.keys():
+        if check_file_physically_exists(folder_paths, cat, filename):
+            return True
+    return False
+
 # Register HTTP endpoint for Frontend Auto-Fixer & Suggestions
 async def _handle_resolve_batch_impl(request):
     try:
@@ -82,24 +104,22 @@ async def _handle_resolve_batch_impl(request):
             # If current_val is already at the requested path, it is NOT missing!
             # -------------------------------------------------------------
             already_exists = False
-            disk_matches = indexer.basename_to_paths.get(req_base, [])
 
-            # Check via in-memory index
-            for cat, rel_p in disk_matches:
-                if rel_p.lower() == clean_val_lower:
-                    already_exists = True
-                    break
+            # Check if it's already in the widget's available options
+            if any(opt.replace("\\", "/").lower() == clean_val_lower for opt in available_vals):
+                already_exists = True
 
-            # Check via folder_paths across all categories
+            # Check via in-memory indexer (exact relative path)
             if not already_exists:
-                for cat in list(getattr(folder_paths, "folder_names_and_paths", {}).keys()):
-                    try:
-                        p = folder_paths.get_full_path(cat, current_val)
-                        if p and (os.path.isfile(p) or os.path.islink(p)):
-                            already_exists = True
-                            break
-                    except Exception:
-                        pass
+                disk_matches = indexer.basename_to_paths.get(req_base, [])
+                for cat, rel_p in disk_matches:
+                    if rel_p.lower() == clean_val_lower:
+                        already_exists = True
+                        break
+
+            # Check via physical disk check across categories
+            if not already_exists and check_file_exists_any_category(folder_paths, current_val):
+                already_exists = True
 
             if already_exists:
                 # Model is present on disk at this exact relative path.
@@ -143,6 +163,7 @@ async def _handle_resolve_batch_impl(request):
                         break
 
             # If not in available_vals, check disk indexer
+            disk_matches = indexer.basename_to_paths.get(req_base, [])
             if not matched_val and disk_matches:
                 # Prioritize matching category
                 for cat, rel_p in disk_matches:
@@ -172,55 +193,47 @@ async def _handle_resolve_batch_impl(request):
 
             # -------------------------------------------------------------
             # STEP 2: Model file truly DOES NOT EXIST anywhere on the system!
-            # Only in this case can we search for SIMILAR model suggestions!
+            # Search for semantic SIMILAR model suggestions!
             # -------------------------------------------------------------
-            best_sim_cand = None
-            best_sim_score = 0.0
+            from .core.model_indexer import calculate_model_similarity
 
-            clean_req_tokens = set(re.findall(r'[a-zA-Z0-9]+', req_stem))
-            req_identity = clean_req_tokens - GENERIC_SUFFIX_TOKENS
+            candidates_map = {}  # opt_path -> score
 
-            # Prioritize available options for this exact widget first
-            for opt in available_vals:
-                opt_norm = opt.replace("\\", "/")
-                opt_base = os.path.basename(opt_norm).lower()
-                opt_s, opt_e = os.path.splitext(opt_base)
-                if opt_e not in VALID_MODEL_EXTENSIONS or opt_base == req_base:
-                    continue
-                opt_tokens = set(re.findall(r'[a-zA-Z0-9]+', opt_s))
-                opt_identity = opt_tokens - GENERIC_SUFFIX_TOKENS
-                common_identity = req_identity.intersection(opt_identity)
-                if not common_identity and not (req_stem[:5] == opt_s[:5] and len(req_stem) > 4):
-                    continue
-                score = difflib.SequenceMatcher(None, req_stem, opt_s).ratio()
-                if score > best_sim_score:
-                    best_sim_score = score
-                    best_sim_cand = opt
+            # 2a. Check available options in widget (preferred source)
+            if available_vals:
+                for opt in available_vals:
+                    opt_norm = opt.replace("\\", "/")
+                    opt_base = os.path.basename(opt_norm).lower()
+                    opt_s, opt_e = os.path.splitext(opt_base)
+                    if opt_e not in VALID_MODEL_EXTENSIONS or opt_base == req_base:
+                        continue
+                    score = calculate_model_similarity(req_base, opt_base)
+                    if score >= 0.58:
+                        candidates_map[opt] = max(candidates_map.get(opt, 0.0), score)
+            else:
+                # 2b. Fallback to indexing category on disk when available_vals is empty
+                sim_list = indexer.find_similar_models(cat_hint, current_val, folder_paths, top_k=3)
+                for full_p, rel_p, score in sim_list:
+                    candidates_map[rel_p] = max(candidates_map.get(rel_p, 0.0), score)
 
-            # Fallback to indexing category on disk
-            if not best_sim_cand or best_sim_score < 0.58:
-                sim_res = indexer.find_similar_model(cat_hint, current_val, folder_paths)
-                if sim_res:
-                    full_p, rel_p, score = sim_res
-                    if score > best_sim_score:
-                        best_sim_score = score
-                        cand_base = os.path.basename(rel_p).lower()
-                        best_sim_cand = rel_p
-                        for opt in available_vals:
-                            if os.path.basename(opt.replace("\\", "/")).lower() == cand_base:
-                                best_sim_cand = opt
-                                break
-
-            if best_sim_cand and best_sim_score >= 0.58:
-                # Ensure the suggested model is NOT identical to current_val
-                if best_sim_cand.replace("\\", "/").lower() != clean_val_lower:
+            if candidates_map:
+                sorted_cands = sorted(candidates_map.items(), key=lambda x: x[1], reverse=True)
+                # Filter out anything that matches current_val
+                valid_cands = [
+                    (opt, sc) for opt, sc in sorted_cands
+                    if opt.replace("\\", "/").lower() != clean_val_lower
+                ]
+                if valid_cands:
+                    best_cand, best_score = valid_cands[0]
+                    alt_list = [{"model": opt, "score": round(sc * 100)} for opt, sc in valid_cands]
                     suggestions.append({
                         "nodeId": node_id,
                         "nodeTitle": node_title,
                         "widgetName": widget_name,
                         "requestedModel": current_val,
-                        "suggestedModel": best_sim_cand,
-                        "similarityScore": round(best_sim_score * 100)
+                        "suggestedModel": best_cand,
+                        "similarityScore": round(best_score * 100),
+                        "alternatives": alt_list
                     })
 
         return web.json_response({

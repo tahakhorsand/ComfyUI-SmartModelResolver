@@ -10,15 +10,91 @@ logger = logging.getLogger("SmartModelResolver")
 
 # Strict set of valid model file extensions (NEVER match .py, .json, etc.)
 VALID_MODEL_EXTENSIONS: Set[str] = {
-    '.safetensors', '.ckpt', '.pt', '.pth', '.bin', '.sft'
+    '.safetensors', '.ckpt', '.pt', '.pth', '.bin', '.sft', '.onnx'
 }
 
 # Generic technical suffix tokens that should not count as model family identity
 GENERIC_SUFFIX_TOKENS: Set[str] = {
-    'int8', 'int4', 'int2', 'fp8', 'fp16', 'bf16', 'fp32', 'f32', 'f16',
+    'int8', 'int4', 'int2', 'fp8', 'fp16', 'bf16', 'fp32', 'f32', 'f16', 'fp4',
     'convrot', 'scaled', 'pruned', 'unpruned', 'safetensors', 'ckpt', 'pt',
-    'pth', 'bin', 'sft', 'e4m3fn', 'e5m2', 'emaonly', 'nonema', 'diffusers'
+    'pth', 'bin', 'sft', 'onnx', 'e4m3fn', 'e5m2', 'emaonly', 'nonema', 'diffusers',
+    'awq', 'nvfp4', 'mixed', 'comfy', 'comfyui'
 }
+
+KNOWN_MODEL_FAMILIES = [
+    'gemma', 'qwen', 'flux', 'ltx', 'sdxl', 'sd', 'hunyuan', 'wan',
+    'minimax', 'cogvideo', 'mochi', 'aura', 'kolors', 't5', 'clip',
+    'siglip', 'eva02', 'vit', 'chameleon', 'deepseek', 'llama', 'mistral'
+]
+
+def extract_semantic_features(name: str) -> dict:
+    name_clean = re.sub(r'\.(safetensors|ckpt|pt|pth|bin|sft|onnx)$', '', name.lower())
+    raw_tokens = re.split(r'[-_.\s/]+', name_clean)
+    tokens = [t for t in raw_tokens if t]
+
+    sizes = set()
+    families = set()
+    filtered_tokens = set()
+
+    for t in tokens:
+        if re.match(r'^\d+(\.\d+)?b$', t):
+            sizes.add(t)
+            continue
+
+        found_fam = False
+        for kf in KNOWN_MODEL_FAMILIES:
+            if t.startswith(kf) or kf in t:
+                families.add(kf)
+                found_fam = True
+                break
+
+        if not found_fam and t not in GENERIC_SUFFIX_TOKENS:
+            filtered_tokens.add(t)
+
+    return {
+        'name_clean': name_clean,
+        'tokens': set(tokens),
+        'content_tokens': filtered_tokens,
+        'sizes': sizes,
+        'families': families
+    }
+
+def calculate_model_similarity(req_name: str, cand_name: str) -> float:
+    req_f = extract_semantic_features(req_name)
+    cand_f = extract_semantic_features(cand_name)
+
+    seq_score = difflib.SequenceMatcher(None, req_f['name_clean'], cand_f['name_clean']).ratio()
+
+    fam_match = False
+    if req_f['families'] and cand_f['families']:
+        if req_f['families'].intersection(cand_f['families']):
+            fam_match = True
+        else:
+            return 0.0
+    elif req_f['name_clean'][:4] == cand_f['name_clean'][:4] and len(req_f['name_clean']) >= 4:
+        fam_match = True
+
+    if not fam_match:
+        return seq_score if seq_score >= 0.65 else 0.0
+
+    score = 0.50
+
+    if req_f['sizes'] and cand_f['sizes']:
+        if req_f['sizes'].intersection(cand_f['sizes']):
+            score += 0.25
+        else:
+            score -= 0.10
+    elif not req_f['sizes'] and not cand_f['sizes']:
+        score += 0.08
+
+    all_content = req_f['content_tokens'].union(cand_f['content_tokens'])
+    if all_content:
+        common_content = req_f['content_tokens'].intersection(cand_f['content_tokens'])
+        jaccard = len(common_content) / len(all_content)
+        score += jaccard * 0.20
+
+    score += seq_score * 0.15
+    return min(0.99, max(0.0, score))
 
 class SmartModelIndex:
     _instance = None
@@ -136,74 +212,68 @@ class SmartModelIndex:
 
         return None
 
-    def find_similar_model(self, folder_name: str, requested_name: str, folder_paths) -> Optional[Tuple[str, str, float]]:
+    def find_similar_models(self, folder_name: str, requested_name: str, folder_paths, top_k: int = 3) -> List[Tuple[str, str, float]]:
         """
-        Looks for a genuine SIMILAR model candidate (e.g. Gemma, Minimax, Qwen revisions/variants).
-        Strictly requires matching at least one model identity token (not generic int8/fp8 tags).
-        Returns (full_path, rel_path, similarity_score) or None.
+        Looks for genuine SIMILAR model candidates (e.g. Gemma, Minimax, Qwen revisions/variants).
+        Returns list of (full_path, rel_path, similarity_score) sorted descending by score.
+        Strictly searches only compatible model categories.
         """
         if not requested_name or not isinstance(requested_name, str):
-            return None
+            return []
 
         clean_req = requested_name.strip().replace("\\", "/")
         req_base = os.path.basename(clean_req).lower()
-        req_stem, req_ext = os.path.splitext(req_base)
+        req_ext = os.path.splitext(req_base)[-1].lower()
 
         if req_ext and req_ext not in VALID_MODEL_EXTENSIONS:
-            return None
+            return []
 
         self.scan_all(folder_paths)
         folder_name = folder_paths.map_legacy(folder_name)
 
-        # Candidates pool: search primary category first
+        compatible_map = {
+            "text_encoders": ["text_encoders", "clip"],
+            "clip": ["text_encoders", "clip"],
+            "diffusion_models": ["diffusion_models", "unet", "checkpoints"],
+            "unet": ["diffusion_models", "unet", "checkpoints"],
+            "checkpoints": ["checkpoints", "diffusion_models"],
+            "vae": ["vae", "vae_approx"],
+            "loras": ["loras"],
+            "controlnet": ["controlnet"],
+            "upscale_models": ["upscale_models"],
+        }
+
+        search_cats = compatible_map.get(folder_name, [folder_name])
         candidates = []
-        if folder_name in self.cached_files_by_category:
-            for rel_p in self.cached_files_by_category[folder_name]:
-                candidates.append((folder_name, rel_p))
+        for cat in search_cats:
+            mapped_cat = folder_paths.map_legacy(cat) if hasattr(folder_paths, "map_legacy") else cat
+            if mapped_cat in self.cached_files_by_category:
+                for rel_p in self.cached_files_by_category[mapped_cat]:
+                    candidates.append((mapped_cat, rel_p))
 
-        # Also search other key categories (text_encoders, diffusion_models, checkpoints, loras)
-        key_cats = ["text_encoders", "diffusion_models", "checkpoints", "loras", "vae"]
-        for cat in key_cats:
-            if cat != folder_name and cat in self.cached_files_by_category:
-                for rel_p in self.cached_files_by_category[cat]:
-                    candidates.append((cat, rel_p))
-
-        best_candidate = None
-        best_score = 0.0
-
-        clean_req_tokens = set(re.findall(r'[a-zA-Z0-9]+', req_stem))
-        req_identity = clean_req_tokens - GENERIC_SUFFIX_TOKENS
+        seen_rel = set()
+        results = []
 
         for cat, rel_p in candidates:
-            cand_base = os.path.basename(rel_p).lower()
-            cand_stem, cand_ext = os.path.splitext(cand_base)
-
-            if cand_ext not in VALID_MODEL_EXTENSIONS:
+            if rel_p in seen_rel:
                 continue
+            seen_rel.add(rel_p)
 
-            # Don't suggest exact matches here (those are handled by find_model)
+            cand_base = os.path.basename(rel_p).lower()
             if cand_base == req_base:
                 continue
 
-            cand_tokens = set(re.findall(r'[a-zA-Z0-9]+', cand_stem))
-            cand_identity = cand_tokens - GENERIC_SUFFIX_TOKENS
-
-            # Must share at least one genuine model identity token or 5-char prefix
-            common_identity = req_identity.intersection(cand_identity)
-            if not common_identity and not (req_stem[:5] == cand_stem[:5] and len(req_stem) > 4):
-                continue
-
-            # Calculate string similarity ratio
-            score = difflib.SequenceMatcher(None, req_stem, cand_stem).ratio()
-            if score > best_score:
-                best_score = score
+            score = calculate_model_similarity(req_base, cand_base)
+            if score >= 0.58:
                 try:
                     full_p = folder_paths.get_full_path(cat, rel_p)
                 except Exception:
                     full_p = rel_p
-                best_candidate = (full_p, rel_p, score)
+                results.append((full_p, rel_p, score))
 
-        if best_candidate and best_score >= 0.58:
-            return best_candidate
+        results.sort(key=lambda x: x[2], reverse=True)
+        return results[:top_k]
 
-        return None
+    def find_similar_model(self, folder_name: str, requested_name: str, folder_paths) -> Optional[Tuple[str, str, float]]:
+        candidates = self.find_similar_models(folder_name, requested_name, folder_paths, top_k=1)
+        return candidates[0] if candidates else None

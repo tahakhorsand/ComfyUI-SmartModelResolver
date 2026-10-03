@@ -18,21 +18,21 @@ app.registerExtension({
                 flex-direction: column;
                 gap: 12px;
                 pointer-events: none;
-                max-width: 480px;
+                max-width: 500px;
                 width: calc(100vw - 40px);
             }
             .smr-glass-card {
                 pointer-events: auto;
-                background: rgba(14, 20, 32, 0.90);
+                background: rgba(14, 20, 32, 0.92);
                 backdrop-filter: blur(20px) saturate(190%);
                 -webkit-backdrop-filter: blur(20px) saturate(190%);
-                border: 1px solid rgba(0, 240, 210, 0.32);
+                border: 1px solid rgba(0, 240, 210, 0.35);
                 border-radius: 12px;
                 padding: 16px 18px;
                 color: #e2e8f0;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
                 font-size: 13px;
-                box-shadow: 0 20px 48px rgba(0, 0, 0, 0.65), 0 0 24px rgba(0, 240, 210, 0.14);
+                box-shadow: 0 20px 48px rgba(0, 0, 0, 0.65), 0 0 24px rgba(0, 240, 210, 0.15);
                 display: flex;
                 flex-direction: column;
                 gap: 12px;
@@ -40,7 +40,7 @@ app.registerExtension({
                 transition: transform 0.2s, opacity 0.2s;
             }
             .smr-glass-card:hover {
-                border-color: rgba(0, 240, 210, 0.50);
+                border-color: rgba(0, 240, 210, 0.55);
             }
             @keyframes smr-slide-in {
                 from { transform: translateX(50px); opacity: 0; }
@@ -158,13 +158,30 @@ app.registerExtension({
                 word-break: break-all;
                 display: flex;
                 flex-direction: column;
-                gap: 2px;
+                gap: 3px;
             }
             .smr-req-tag {
                 color: #f87171;
             }
             .smr-sug-tag {
                 color: #34d399;
+            }
+            .smr-cand-select {
+                background: #091018;
+                color: #4efce5;
+                border: 1px solid rgba(0, 240, 210, 0.45);
+                border-radius: 4px;
+                padding: 3px 6px;
+                font-size: 11px;
+                font-family: inherit;
+                outline: none;
+                cursor: pointer;
+                margin-top: 2px;
+                max-width: 100%;
+            }
+            .smr-cand-select:focus {
+                border-color: #00f0d2;
+                box-shadow: 0 0 6px rgba(0, 240, 210, 0.35);
             }
             .smr-card-footer {
                 display: flex;
@@ -236,7 +253,7 @@ app.registerExtension({
         notifContainer.id = "smr-notification-center";
         document.body.appendChild(notifContainer);
 
-        // Session tracking to ensure strictly NO repeated notification loops
+        // Session tracking
         const sessionIgnoredKeys = new Set();
         let isApplyingBatch = false;
         let isScanning = false;
@@ -284,16 +301,21 @@ app.registerExtension({
             }
         };
 
-        // Recursively traverse all nodes across root graph and all Subgraphs
+        // Recursively traverse all nodes across root graph and all Subgraphs.
+        // Returns ONLY leaf nodes (actual processing nodes) with parentSubgraphNode reference.
+        // Outer Subgraph wrapper nodes are recursed into, not returned directly, to eliminate duplicate widgets.
         function collectAllGraphNodes(rootGraph) {
             const result = [];
             function traverse(graph, parentSubgraphNode = null) {
                 if (!graph) return;
                 const nodes = graph._nodes || graph.nodes || [];
                 for (const node of nodes) {
-                    result.push({ node, graph, parentSubgraphNode });
                     if (node.isSubgraphNode?.() && node.subgraph) {
+                        // Subgraph wrapper node: traverse into its inner graph
                         traverse(node.subgraph, node);
+                    } else {
+                        // Leaf node
+                        result.push({ node, graph, parentSubgraphNode });
                     }
                 }
             }
@@ -301,7 +323,7 @@ app.registerExtension({
             return result;
         }
 
-        // Apply a single widget update cleanly across graph & subgraphs
+        // Apply a single widget update cleanly across leaf node & parent subgraph wrapper
         function applyWidgetUpdate(allNodeEntries, nodeId, widgetName, newValue) {
             const entry = allNodeEntries.find(e => e.node.id === nodeId);
             if (!entry) return;
@@ -320,6 +342,7 @@ app.registerExtension({
                 }
                 node.setDirtyCanvas(true, true);
 
+                // If this widget was promoted to the parent Subgraph node, sync it as well
                 if (parentSubgraphNode && parentSubgraphNode.widgets) {
                     for (const pw of parentSubgraphNode.widgets) {
                         if (pw.name === w.name || pw.value === oldVal) {
@@ -331,28 +354,11 @@ app.registerExtension({
                         }
                     }
                 }
-
-                if (node.isSubgraphNode?.() && node.subgraph) {
-                    const innerNodes = node.subgraph._nodes || node.subgraph.nodes || [];
-                    for (const inNode of innerNodes) {
-                        if (!inNode.widgets) continue;
-                        for (const inW of inNode.widgets) {
-                            if (inW.name === w.name || inW.value === oldVal) {
-                                inW.value = newValue;
-                                if (inW.callback) {
-                                    try { inW.callback(inW.value); } catch (e) {}
-                                }
-                                inNode.setDirtyCanvas(true, true);
-                            }
-                        }
-                    }
-                }
             }
         }
 
         // Consolidated Dialog: Shows ALL exact and similar models in ONE unified card
         function showConsolidatedResolverCard(allNodeEntries, exactResolved, suggestions) {
-            // Remove any existing resolver card
             const prevCard = document.getElementById("smr-resolver-modal");
             if (prevCard) prevCard.remove();
 
@@ -368,11 +374,11 @@ app.registerExtension({
             }
             exactResolved = uniqueExact;
 
-            // Deduplicate suggestions by node & suggested model
+            // Deduplicate suggestions by node & requested model
             const uniqueSuggestions = [];
             const seenSuggestions = new Set();
             for (const s of suggestions) {
-                const k = `${s.nodeId}::${s.widgetName}::${String(s.suggestedModel).toLowerCase()}`;
+                const k = `${s.nodeId}::${s.widgetName}::${String(s.requestedModel).toLowerCase()}`;
                 if (!seenSuggestions.has(k)) {
                     seenSuggestions.add(k);
                     uniqueSuggestions.push(s);
@@ -404,7 +410,7 @@ app.registerExtension({
 
                     itemsHtml += `
                         <label class="smr-item-row" for="smr-item-cb-${idx}">
-                            <input type="checkbox" class="smr-checkbox" id="smr-item-cb-${idx}" data-idx="${idx}" checked />
+                            <input type="checkbox" class="smr-checkbox" id="smr-item-cb-${idx}" data-idx="${idx}" data-type="exact" data-resolved="${resFile}" checked />
                             <div class="smr-item-info">
                                 <div class="smr-item-node">
                                     <span>${item.nodeTitle || 'Node #' + item.nodeId}</span>
@@ -430,11 +436,27 @@ app.registerExtension({
                 for (const s of suggestions) {
                     const idx = itemIndex++;
                     const reqFile = String(s.requestedModel).replace(/\\/g, "/").split("/").pop();
-                    const sugFile = String(s.suggestedModel).replace(/\\/g, "/").split("/").pop();
+                    const defaultSug = String(s.suggestedModel).replace(/\\/g, "/");
+
+                    let optionsHtml = "";
+                    if (s.alternatives && s.alternatives.length > 1) {
+                        optionsHtml = `
+                            <select class="smr-cand-select" id="smr-item-sel-${idx}" data-idx="${idx}">
+                                ${s.alternatives.map((alt, aIdx) => {
+                                    const optPath = String(alt.model).replace(/\\/g, "/");
+                                    const optName = optPath.split("/").pop();
+                                    return `<option value="${optPath}" ${aIdx === 0 ? 'selected' : ''}>${optName} (${alt.score}%)</option>`;
+                                }).join('')}
+                            </select>
+                        `;
+                    } else {
+                        const sugName = defaultSug.split("/").pop();
+                        optionsHtml = `<span class="smr-sug-tag">Available: ${sugName}</span>`;
+                    }
 
                     itemsHtml += `
-                        <label class="smr-item-row" for="smr-item-cb-${idx}">
-                            <input type="checkbox" class="smr-checkbox" id="smr-item-cb-${idx}" data-idx="${idx}" checked />
+                        <div class="smr-item-row" style="cursor: default;">
+                            <input type="checkbox" class="smr-checkbox" id="smr-item-cb-${idx}" data-idx="${idx}" data-type="suggestion" data-default="${defaultSug}" checked />
                             <div class="smr-item-info">
                                 <div class="smr-item-node">
                                     <span>${s.nodeTitle || 'Node #' + s.nodeId}</span>
@@ -442,10 +464,10 @@ app.registerExtension({
                                 </div>
                                 <div class="smr-model-line">
                                     <span class="smr-req-tag">Missing: ${reqFile}</span>
-                                    <span class="smr-sug-tag">Available: ${sugFile}</span>
+                                    ${optionsHtml}
                                 </div>
                             </div>
-                        </label>
+                        </div>
                     `;
                 }
             }
@@ -490,12 +512,11 @@ app.registerExtension({
 
             // Dismiss & Ignore handler
             const dismissAll = () => {
-                // Register all items into sessionIgnoredKeys so they NEVER alert again
                 for (const item of exactResolved) {
-                    sessionIgnoredKeys.add(`${item.nodeId}::${item.widgetName}::${item.originalValue}`);
+                    sessionIgnoredKeys.add(`${item.nodeId}::${item.widgetName}::${String(item.originalValue).replace(/\\/g, "/").toLowerCase()}`);
                 }
                 for (const s of suggestions) {
-                    sessionIgnoredKeys.add(`${s.nodeId}::${s.widgetName}::${s.requestedModel}`);
+                    sessionIgnoredKeys.add(`${s.nodeId}::${s.widgetName}::${String(s.requestedModel).replace(/\\/g, "/").toLowerCase()}`);
                 }
                 card.remove();
             };
@@ -520,7 +541,7 @@ app.registerExtension({
                             applyWidgetUpdate(allNodeEntries, item.nodeId, item.widgetName, item.resolvedValue);
                             appliedCount++;
                         }
-                        sessionIgnoredKeys.add(`${item.nodeId}::${item.widgetName}::${item.originalValue}`);
+                        sessionIgnoredKeys.add(`${item.nodeId}::${item.widgetName}::${String(item.originalValue).replace(/\\/g, "/").toLowerCase()}`);
                         curIdx++;
                     }
 
@@ -528,10 +549,14 @@ app.registerExtension({
                     for (const s of suggestions) {
                         const cb = card.querySelector(`#smr-item-cb-${curIdx}`);
                         if (cb && cb.checked) {
-                            applyWidgetUpdate(allNodeEntries, s.nodeId, s.widgetName, s.suggestedModel);
+                            // Check if user chose an alternative from dropdown
+                            const sel = card.querySelector(`#smr-item-sel-${curIdx}`);
+                            const chosenModel = sel ? sel.value : s.suggestedModel;
+
+                            applyWidgetUpdate(allNodeEntries, s.nodeId, s.widgetName, chosenModel);
                             appliedCount++;
                         }
-                        sessionIgnoredKeys.add(`${s.nodeId}::${s.widgetName}::${s.requestedModel}`);
+                        sessionIgnoredKeys.add(`${s.nodeId}::${s.widgetName}::${String(s.requestedModel).replace(/\\/g, "/").toLowerCase()}`);
                         curIdx++;
                     }
 
@@ -549,7 +574,7 @@ app.registerExtension({
                         );
                     }
                 } catch (err) {
-                    console.error("[SmartModelResolver] Error applying batch replacements:", err);
+                    console.error("[SmartModelResolver] Error applying replacements:", err);
                 } finally {
                     setTimeout(() => {
                         isApplyingBatch = false;
@@ -558,7 +583,7 @@ app.registerExtension({
             };
         }
 
-        // Core Scan & Resolve Logic (Consolidated Single Card)
+        // Core Scan & Resolve Logic
         window.SmartModelResolver_ScanAndFix = async (manualTrigger = false) => {
             if (!app.graph || isScanning || isApplyingBatch) return;
             isScanning = true;
@@ -570,49 +595,65 @@ app.registerExtension({
                 for (const { node, parentSubgraphNode } of allNodeEntries) {
                     if (!node.widgets) continue;
                     for (const w of node.widgets) {
-                        // If this node is inside a subgraph, check if this widget is promoted on parentSubgraphNode
-                        if (parentSubgraphNode && parentSubgraphNode.widgets) {
-                            const isPromoted = parentSubgraphNode.widgets.some(pw =>
-                                pw.name === w.name || (pw.value && String(pw.value).trim().toLowerCase() === String(w.value).trim().toLowerCase())
-                            );
-                            if (isPromoted) continue;
-                        }
+                        const rawVal = w.value;
+                        if (typeof rawVal !== "string") continue;
+                        const val = rawVal.trim();
+                        if (!val) continue;
 
-                        if (w.type === "combo" && w.options && Array.isArray(w.options.values)) {
-                            // If options array is empty (unpopulated wrapper or still loading), skip
-                            if (w.options.values.length === 0) continue;
+                        const lowerVal = val.toLowerCase();
+                        const isModel = lowerVal.endsWith(".safetensors") || lowerVal.endsWith(".ckpt") ||
+                                        lowerVal.endsWith(".pt") || lowerVal.endsWith(".pth") ||
+                                        lowerVal.endsWith(".bin") || lowerVal.endsWith(".sft") ||
+                                        lowerVal.endsWith(".onnx");
+                        if (!isModel) continue;
 
-                            const val = String(w.value || "").trim();
-                            if (!val) continue;
-
-                            const lowerVal = val.toLowerCase();
-                            const isModel = lowerVal.endsWith(".safetensors") || lowerVal.endsWith(".ckpt") ||
-                                            lowerVal.endsWith(".pt") || lowerVal.endsWith(".pth") ||
-                                            lowerVal.endsWith(".bin") || lowerVal.endsWith(".sft");
-                            if (!isModel) continue;
-
-                            const normVal = val.replace(/\\/g, "/").toLowerCase();
-                            const exists = w.options.values.some(opt => {
-                                const normOpt = String(opt).replace(/\\/g, "/").toLowerCase();
-                                return normOpt === normVal || normOpt.endsWith("/" + normVal) || normVal.endsWith("/" + normOpt);
-                            });
-
-                            if (!exists) {
-                                const sessionKey = `${node.id}::${w.name}::${val.toLowerCase()}`;
-                                if (!manualTrigger && sessionIgnoredKeys.has(sessionKey)) {
-                                    continue;
-                                }
-
-                                missingEntries.push({
-                                    nodeId: node.id,
-                                    nodeTitle: node.title || node.type,
-                                    parentSubgraphId: parentSubgraphNode ? parentSubgraphNode.id : null,
-                                    widgetName: w.name,
-                                    currentValue: val,
-                                    availableValues: w.options.values
-                                });
+                        // Retrieve available options
+                        let availableValues = [];
+                        if (w.options) {
+                            if (Array.isArray(w.options.values)) {
+                                availableValues = w.options.values;
+                            } else if (typeof w.options.values === "function") {
+                                try {
+                                    const res = w.options.values(w, node);
+                                    if (Array.isArray(res)) availableValues = res;
+                                } catch (e) {}
                             }
                         }
+
+                        const normVal = val.replace(/\\/g, "/").toLowerCase();
+
+                        // If availableValues has items, check if current value is present
+                        if (availableValues.length > 0) {
+                            const exists = availableValues.some(opt => {
+                                const normOpt = String(opt).replace(/\\/g, "/").toLowerCase();
+                                return normOpt === normVal;
+                            });
+
+                            if (exists) {
+                                // Model is already present and fully valid
+                                continue;
+                            }
+                        }
+
+                        const sessionKey = `${node.id}::${w.name}::${normVal}`;
+                        if (!manualTrigger && sessionIgnoredKeys.has(sessionKey)) {
+                            continue;
+                        }
+
+                        let displayTitle = node.title || node.type || `Node #${node.id}`;
+                        if (parentSubgraphNode) {
+                            const pTitle = parentSubgraphNode.title || parentSubgraphNode.type || "Group";
+                            displayTitle = `${pTitle} ➔ ${displayTitle}`;
+                        }
+
+                        missingEntries.push({
+                            nodeId: node.id,
+                            nodeTitle: displayTitle,
+                            parentSubgraphId: parentSubgraphNode ? parentSubgraphNode.id : null,
+                            widgetName: w.name,
+                            currentValue: val,
+                            availableValues: availableValues
+                        });
                     }
                 }
 
@@ -648,7 +689,7 @@ app.registerExtension({
                 if (exactResolved.length > 0 || suggestions.length > 0) {
                     showConsolidatedResolverCard(allNodeEntries, exactResolved, suggestions);
                 } else if (manualTrigger) {
-                    window.SmartModelResolver_Notify("Scan Result", "No matching subfolders or similar models found.", 3500);
+                    window.SmartModelResolver_Notify("Scan Result", "No matching subfolders or similar models found on disk.", 3500);
                 }
 
             } catch (err) {
@@ -658,18 +699,31 @@ app.registerExtension({
             }
         };
 
-        // Hook workflow load events with debounce (Runs ONLY ONCE after user loads workflow)
+        // Hook workflow load events: reset session memory and trigger scan once loaded
         const origLoadGraphData = app.loadGraphData;
-        app.loadGraphData = function (graphData) {
-            const res = origLoadGraphData.apply(this, arguments);
+        app.loadGraphData = async function (graphData) {
+            sessionIgnoredKeys.clear();
+            lastNotifiedSignature = "";
+
+            const res = await origLoadGraphData.apply(this, arguments);
+
             if (isApplyingBatch) return res;
 
             if (scanDebounceTimer) clearTimeout(scanDebounceTimer);
             scanDebounceTimer = setTimeout(() => {
                 window.SmartModelResolver_ScanAndFix(false);
-            }, 800);
+            }, 650);
+
             return res;
         };
+
+        // Also reset session trackers on graph clean/clear
+        if (api && api.addEventListener) {
+            api.addEventListener("graphCleared", () => {
+                sessionIgnoredKeys.clear();
+                lastNotifiedSignature = "";
+            });
+        }
 
         console.log("[SmartModelResolver] Extension ready (Consolidated Single Card).");
     }
