@@ -1,0 +1,41 @@
+name: Publish to Comfy Registry
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install comfy-cli
+
+      - name: Validate Custom Node
+        run: |
+          comfy node validate
+
+      - name: Publish to Comfy Registry
+        env:
+          COMFY_TOKEN: ${{ secrets.COMFY_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$COMFY_TOKEN" ]; then
+            echo "::error::COMFY_REGISTRY_TOKEN secret is not set! Please add it in repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          comfy node publish --token "$COMFY_TOKEN"
