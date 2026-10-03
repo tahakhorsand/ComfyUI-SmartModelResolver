@@ -27,8 +27,7 @@ Eliminates workflow loading failures, missing subfolder paths, and red widget er
 
 1. Open a terminal inside your ComfyUI `custom_nodes` directory:
    ```bash
-   cd ComfyUI/custom_nodes
-   git clone https://github.com/your-username/ComfyUI-SmartModelResolver.git
+   git clone https://github.com/your-username/ComfyUI-SmartModelResolver
    ```
 2. Restart ComfyUI.
 3. Open any workflow. If models are in subfolders or close alternatives exist, the glassmorphic assistant will appear in the top-right corner.
