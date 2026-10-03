@@ -1,0 +1,2 @@
+# ComfyUI-SmartModelResolver uses Python standard libraries and native ComfyUI APIs.
+# No external pip dependencies required.
