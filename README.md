@@ -34,7 +34,7 @@ Selected paths are instantly mapped directly to your graph and subgraphs without
 ## ✨ Features
 
 - **🔍 Automatic Subfolder Resolution**:
-  Instantly discovers and links models stored inside local subfolders (e.g. `marigold/marigold_v2_normals.safetensors`).
+  Instantly discovers and links models stored inside local subfolders.
 - **💡 Smart Model Suggestions**:
   When a workflow requests a model you do not have (e.g., `minimax_h3_fl2va_pruned_int8_convrot`), the assistant detects authentic alternatives in your library (e.g., `minimax_h3_fl2va_int8_convrot` with 89%+ match) and lets you replace them in one click.
 - **⚡ Consolidated Batch Resolver**:
@@ -45,16 +45,12 @@ Selected paths are instantly mapped directly to your graph and subgraphs without
   Recursively traverses both root graphs and inner subgraphs, keeping promoted inputs and internal definitions perfectly in sync.
 - **🛡️ Strict File Protection**:
   Only matches authentic neural model formats (`.safetensors`, `.ckpt`, `.pt`, `.pth`, `.bin`, `.sft`). Never matches `.py`, `.json`, or non-model files.
-- **🔕 Non-Intrusive & Single-Shot**:
-  Never blocks canvas interaction. Respects dismissals for the entire session and strictly prevents notification loops.
-
 ---
 
 ## 🚀 Installation
 
 1. Open a terminal inside your ComfyUI `custom_nodes` directory:
    ```bash
-   cd custom_nodes
    git clone https://github.com/tahakhorsand/ComfyUI-SmartModelResolver.git
    ```
 2. Restart ComfyUI.
