@@ -2,7 +2,7 @@
 name = "comfyui-smartmodelresolver"
 description = "Intelligent subfolder auto-linker and model replacement suggestion assistant for ComfyUI."
 version = "1.0.0"
-license = { text = "MIT" }
+license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "Taha Khorsand" }]
 keywords = ["comfyui", "custom-nodes", "model-resolver", "subfolders", "workflow-fixer"]
 dependencies = []
