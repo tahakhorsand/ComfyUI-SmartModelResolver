@@ -23,7 +23,7 @@ app.registerExtension({
             }
             .smr-glass-card {
                 pointer-events: auto;
-                background: rgba(14, 20, 32, 0.82);
+                background: rgba(14, 20, 32, 0.85);
                 backdrop-filter: blur(18px) saturate(190%);
                 -webkit-backdrop-filter: blur(18px) saturate(190%);
                 border: 1px solid rgba(0, 240, 210, 0.28);
@@ -180,6 +180,11 @@ app.registerExtension({
         notifContainer.id = "smr-notification-center";
         document.body.appendChild(notifContainer);
 
+        // State tracker to strictly prevent repeated notifications
+        let lastNotifiedSignature = "";
+        let isProcessingScan = false;
+        let scanDebounceTimer = null;
+
         // Toolbar menu button
         const menu = document.querySelector(".comfy-menu");
         if (menu) {
@@ -191,10 +196,14 @@ app.registerExtension({
             menu.appendChild(btn);
         }
 
-        // Generic lightweight notification card
-        window.SmartModelResolver_Notify = (title, message, actionLabel = null, onAction = null, duration = 8000) => {
+        // Generic notification card (only 1 can exist at a time)
+        window.SmartModelResolver_Notify = (title, message, actionLabel = null, onAction = null, duration = 6000) => {
+            // Remove any previous info card to prevent stacking
+            const prevCard = notifContainer.querySelector(".smr-info-card");
+            if (prevCard) prevCard.remove();
+
             const card = document.createElement("div");
-            card.className = "smr-glass-card";
+            card.className = "smr-glass-card smr-info-card";
 
             let actionHtml = "";
             if (actionLabel && onAction) {
@@ -231,8 +240,12 @@ app.registerExtension({
 
         // Non-blocking Glassmorphic Suggestion Card (Floats at top-right without blocking canvas)
         window.SmartModelResolver_ShowSuggestionCard = (sugg, onConfirm, onIgnore) => {
+            // Remove any previous suggestion card
+            const prevSugg = notifContainer.querySelector(".smr-sugg-card");
+            if (prevSugg) prevSugg.remove();
+
             const card = document.createElement("div");
-            card.className = "smr-glass-card";
+            card.className = "smr-glass-card smr-sugg-card";
 
             const reqFile = String(sugg.requestedModel).replace(/\\/g, "/").split("/").pop();
             const sugFile = String(sugg.suggestedModel).replace(/\\/g, "/").split("/").pop();
@@ -338,7 +351,7 @@ app.registerExtension({
                 try {
                     await app.refreshMissingModels({ silent: true });
                 } catch (e) {
-                    console.warn("[SmartModelResolver] refreshMissingModels failed:", e);
+                    // Suppress
                 }
             }
 
@@ -346,52 +359,61 @@ app.registerExtension({
             if (app.canvas) app.canvas.draw(true, true);
         }
 
-        // Core Scan & Resolve Logic
+        // Core Scan & Resolve Logic (Single-Shot per workflow load)
         window.SmartModelResolver_ScanAndFix = async (manualTrigger = false) => {
-            if (!app.graph) return;
-            const allNodeEntries = collectAllGraphNodes(app.graph);
-            const missingEntries = [];
+            if (!app.graph || isProcessingScan) return;
+            isProcessingScan = true;
 
-            for (const { node, parentSubgraphNode } of allNodeEntries) {
-                if (!node.widgets) continue;
-                for (const w of node.widgets) {
-                    if (w.type === "combo" && w.options && Array.isArray(w.options.values)) {
-                        const val = String(w.value || "");
-                        if (!val) continue;
+            try {
+                const allNodeEntries = collectAllGraphNodes(app.graph);
+                const missingEntries = [];
 
-                        const lowerVal = val.toLowerCase();
-                        const isModel = lowerVal.endsWith(".safetensors") || lowerVal.endsWith(".ckpt") ||
-                                        lowerVal.endsWith(".pt") || lowerVal.endsWith(".pth") ||
-                                        lowerVal.endsWith(".bin") || lowerVal.endsWith(".sft");
-                        if (!isModel) continue;
+                for (const { node, parentSubgraphNode } of allNodeEntries) {
+                    if (!node.widgets) continue;
+                    for (const w of node.widgets) {
+                        if (w.type === "combo" && w.options && Array.isArray(w.options.values)) {
+                            const val = String(w.value || "");
+                            if (!val) continue;
 
-                        const normVal = val.replace(/\\/g, "/");
-                        const exists = w.options.values.some(opt => opt.replace(/\\/g, "/") === normVal);
+                            const lowerVal = val.toLowerCase();
+                            const isModel = lowerVal.endsWith(".safetensors") || lowerVal.endsWith(".ckpt") ||
+                                            lowerVal.endsWith(".pt") || lowerVal.endsWith(".pth") ||
+                                            lowerVal.endsWith(".bin") || lowerVal.endsWith(".sft");
+                            if (!isModel) continue;
 
-                        if (!exists) {
-                            missingEntries.push({
-                                nodeId: node.id,
-                                nodeTitle: node.title || node.type,
-                                parentSubgraphId: parentSubgraphNode ? parentSubgraphNode.id : null,
-                                widgetName: w.name,
-                                currentValue: val,
-                                availableValues: w.options.values
-                            });
+                            const normVal = val.replace(/\\/g, "/");
+                            const exists = w.options.values.some(opt => opt.replace(/\\/g, "/") === normVal);
+
+                            if (!exists) {
+                                missingEntries.push({
+                                    nodeId: node.id,
+                                    nodeTitle: node.title || node.type,
+                                    parentSubgraphId: parentSubgraphNode ? parentSubgraphNode.id : null,
+                                    widgetName: w.name,
+                                    currentValue: val,
+                                    availableValues: w.options.values
+                                });
+                            }
                         }
                     }
                 }
-            }
 
-            if (missingEntries.length === 0) {
-                if (manualTrigger) {
-                    window.SmartModelResolver_Notify("Verification Complete", "All model paths match your local directories cleanly.", null, null, 4000);
+                // Compute signature of current missing models
+                const currentSignature = missingEntries.map(e => `${e.nodeId}:${e.widgetName}:${e.currentValue}`).sort().join("|");
+
+                if (missingEntries.length === 0) {
+                    if (manualTrigger) {
+                        window.SmartModelResolver_Notify("Verification Complete", "All model paths match your local directories cleanly.", null, null, 3500);
+                    }
+                    lastNotifiedSignature = "";
+                    return;
                 }
-                return;
-            }
 
-            console.log(`[SmartModelResolver] Scanning ${missingEntries.length} model widgets...`);
+                // If this exact state was already notified automatically, DO NOT REPEAT!
+                if (!manualTrigger && currentSignature === lastNotifiedSignature) {
+                    return;
+                }
 
-            try {
                 const response = await api.fetchApi("/smart_model_resolver/resolve_batch", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
@@ -403,13 +425,17 @@ app.registerExtension({
                 const exactResolved = result.resolved || [];
                 const suggestions = result.suggestions || [];
 
+                // Mark as notified so it never repeats in a loop
+                lastNotifiedSignature = currentSignature;
+
                 // 1. Exact Subfolder Matches (e.g. marigold_v2_normals.safetensors in marigold/)
                 if (exactResolved.length > 0) {
                     const applyExactFixes = async () => {
                         for (const item of exactResolved) {
                             await applyWidgetUpdate(allNodeEntries, item.nodeId, item.widgetName, item.resolvedValue);
                         }
-                        window.SmartModelResolver_Notify("Subfolders Resolved", `Successfully linked ${exactResolved.length} model(s) to local paths.`, null, null, 5000);
+                        // Simple 1-time toast
+                        window.SmartModelResolver_Notify("Subfolders Linked", `Matched ${exactResolved.length} model(s) to local subfolders.`, null, null, 3500);
                     };
 
                     const countText = exactResolved.length === 1 ? "1 exact model" : `${exactResolved.length} exact models`;
@@ -418,7 +444,7 @@ app.registerExtension({
                         `Located <b>${countText}</b> in local subfolders.`,
                         "⚡ Auto-Link",
                         applyExactFixes,
-                        10000
+                        8000
                     );
                 }
 
@@ -433,7 +459,6 @@ app.registerExtension({
                             s,
                             async () => {
                                 await applyWidgetUpdate(allNodeEntries, s.nodeId, s.widgetName, s.suggestedModel);
-                                window.SmartModelResolver_Notify("Model Replaced", `Updated to <b>${s.suggestedModel.split(/[\/\\]/).pop()}</b>.`, null, null, 4000);
                                 displayNextSuggestion();
                             },
                             () => {
@@ -442,26 +467,29 @@ app.registerExtension({
                         );
                     };
 
-                    setTimeout(displayNextSuggestion, exactResolved.length > 0 ? 1000 : 200);
+                    setTimeout(displayNextSuggestion, exactResolved.length > 0 ? 1000 : 100);
                 } else if (exactResolved.length === 0 && manualTrigger) {
-                    window.SmartModelResolver_Notify("Scan Result", "No exact subfolders or similar models found.", null, null, 5000);
+                    window.SmartModelResolver_Notify("Scan Result", "No exact subfolders or similar models found.", null, null, 3500);
                 }
 
             } catch (err) {
                 console.error("[SmartModelResolver] Error resolving models:", err);
+            } finally {
+                isProcessingScan = false;
             }
         };
 
-        // Hook workflow load events
+        // Hook workflow load events with debounce (Runs ONLY ONCE after user loads workflow)
         const origLoadGraphData = app.loadGraphData;
         app.loadGraphData = function (graphData) {
             const res = origLoadGraphData.apply(this, arguments);
-            setTimeout(() => {
+            if (scanDebounceTimer) clearTimeout(scanDebounceTimer);
+            scanDebounceTimer = setTimeout(() => {
                 window.SmartModelResolver_ScanAndFix(false);
-            }, 1200);
+            }, 1000);
             return res;
         };
 
-        console.log("[SmartModelResolver] Extension ready.");
+        console.log("[SmartModelResolver] Extension ready (Single-notification debounced).");
     }
 });
