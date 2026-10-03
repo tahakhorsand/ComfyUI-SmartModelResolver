@@ -252,10 +252,6 @@ def check_file_exists_any_category(folder_paths, filename: str) -> bool:
     for cat in folder_map.keys():
         if check_file_physically_exists(folder_paths, cat, filename):
             return True
-    indexer = SmartModelIndex.get_instance()
-    req_base = os.path.basename(filename.replace("\\", "/")).lower()
-    if req_base in indexer.basename_to_paths:
-        return True
     return False
 
 # Register HTTP endpoint for Frontend Auto-Fixer & Suggestions
@@ -379,6 +375,7 @@ async def _handle_resolve_batch_impl(request):
                     exact_resolved.append({
                         "nodeId": node_id,
                         "nodeTitle": node_title,
+                        "parentSubgraphIds": entry.get("parentSubgraphIds", []),
                         "widgetName": widget_name,
                         "originalValue": current_val,
                         "resolvedValue": matched_val,
@@ -394,7 +391,7 @@ async def _handle_resolve_batch_impl(request):
 
             candidates_map = {}  # opt_path -> score
 
-            # 2a. Check available options in widget (preferred source)
+            # 2a. Check available options in widget
             if available_vals:
                 for opt in available_vals:
                     opt_norm = opt.replace("\\", "/")
@@ -405,11 +402,15 @@ async def _handle_resolve_batch_impl(request):
                     score = calculate_model_similarity(req_base, opt_base)
                     if score >= 0.58:
                         candidates_map[opt] = max(candidates_map.get(opt, 0.0), score)
-            else:
-                # 2b. Fallback to indexing category on disk when available_vals is empty
-                sim_list = indexer.find_similar_models(cat_hint, current_val, folder_paths, top_k=3)
+
+            # 2b. Also search indexed disk models in the same category to guarantee fresh candidates
+            try:
+                sim_list = indexer.find_similar_models(cat_hint, current_val, folder_paths, top_k=5)
                 for full_p, rel_p, score in sim_list:
-                    candidates_map[rel_p] = max(candidates_map.get(rel_p, 0.0), score)
+                    if score >= 0.58:
+                        candidates_map[rel_p] = max(candidates_map.get(rel_p, 0.0), score)
+            except Exception:
+                pass
 
             if candidates_map:
                 sorted_cands = sorted(candidates_map.items(), key=lambda x: x[1], reverse=True)
@@ -424,6 +425,7 @@ async def _handle_resolve_batch_impl(request):
                     suggestions.append({
                         "nodeId": node_id,
                         "nodeTitle": node_title,
+                        "parentSubgraphIds": entry.get("parentSubgraphIds", []),
                         "widgetName": widget_name,
                         "requestedModel": current_val,
                         "suggestedModel": best_cand,

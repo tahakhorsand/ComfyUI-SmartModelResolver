@@ -517,6 +517,15 @@ app.registerExtension({
                         }
                     }
                 }
+
+                // Also sync any promoted inputs defined on the Subgraph node
+                if (parentNode.inputs && Array.isArray(parentNode.inputs)) {
+                    for (const inp of parentNode.inputs) {
+                        if (inp && inp.widget && (inp.name === w.name || inp.widget.name === w.name)) {
+                            try { inp.widget.value = exactValue; } catch (e) {}
+                        }
+                    }
+                }
             }
 
             return true;
@@ -550,6 +559,23 @@ app.registerExtension({
                 }
             }
             suggestions = uniqueSuggestions;
+
+            // Remove any parent Subgraph container rows if an inner leaf node is already shown
+            const childParentIds = new Set();
+            for (const item of exactResolved) {
+                if (item.parentSubgraphIds && Array.isArray(item.parentSubgraphIds)) {
+                    for (const pid of item.parentSubgraphIds) childParentIds.add(String(pid));
+                }
+            }
+            for (const s of suggestions) {
+                if (s.parentSubgraphIds && Array.isArray(s.parentSubgraphIds)) {
+                    for (const pid of s.parentSubgraphIds) childParentIds.add(String(pid));
+                }
+            }
+            if (childParentIds.size > 0) {
+                exactResolved = exactResolved.filter(item => !childParentIds.has(String(item.nodeId)));
+                suggestions = suggestions.filter(s => !childParentIds.has(String(s.nodeId)));
+            }
 
             const totalCount = exactResolved.length + suggestions.length;
             if (totalCount === 0) return;
@@ -789,6 +815,16 @@ app.registerExtension({
                 const missingEntries = [];
 
                 for (const { node, parentChain } of allNodeEntries) {
+                    // Do not scan Subgraph wrapper nodes directly if they have inner child nodes;
+                    // scan only the inner concrete leaf nodes where the actual loaders reside!
+                    const isSubgraphWrapper = (typeof node.isSubgraphNode === "function" ? node.isSubgraphNode() : !!node.isSubgraphNode) || !!node.subgraph;
+                    if (isSubgraphWrapper && node.subgraph) {
+                        const innerNodes = node.subgraph._nodes || node.subgraph.nodes || [];
+                        if (innerNodes.length > 0) {
+                            continue;
+                        }
+                    }
+
                     if (!node.widgets) continue;
                     for (const w of node.widgets) {
                         const rawVal = w.value;
@@ -854,7 +890,7 @@ app.registerExtension({
                         missingEntries.push({
                             nodeId: node.id,
                             nodeTitle: displayTitle,
-                            parentSubgraphId: parentChain && parentChain.length > 0 ? parentChain[parentChain.length - 1].id : null,
+                            parentSubgraphIds: parentChain ? parentChain.map(p => String(p.id)) : [],
                             widgetName: w.name,
                             currentValue: val,
                             availableValues: availableValues
