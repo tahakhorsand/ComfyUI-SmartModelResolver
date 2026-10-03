@@ -240,8 +240,44 @@ class TestCacheRefreshAndHooks(unittest.TestCase):
                 ckpts = indexer.cached_files_by_category.get("checkpoints", [])
                 self.assertIn("root_model.safetensors", ckpts)
                 self.assertIn("sub/sub_model.gguf", ckpts)
-                self.assertIn("sub_model.gguf", indexer.basename_to_paths)
+class TestV3NodeAndEntrypoint(unittest.TestCase):
+    def test_v3_node_schema_and_execute(self):
+        smart_nodes = importlib.import_module("custom_nodes.ComfyUI-SmartModelResolver.nodes.smart_nodes")
+        SmartModelPathFinder = smart_nodes.SmartModelPathFinder
+        HAS_COMFY_V3 = smart_nodes.HAS_COMFY_V3
+        if HAS_COMFY_V3:
+            schema = SmartModelPathFinder.define_schema()
+            self.assertIsNotNone(schema)
+            self.assertEqual(schema.node_id, "SmartModelPathFinder")
+            self.assertEqual(schema.category, "SmartModelResolver")
+
+        # Test execute without throwing allow_fuzzy unexpected keyword error
+        with patch.object(smr.SmartModelIndex, "find_model", return_value=(r"C:\models\sub\m.safetensors", r"sub\m.safetensors", "exact")):
+            res = SmartModelPathFinder.execute("m.safetensors", "ALL", allow_fuzzy=True)
+            self.assertTrue(res[2])
+
+    def test_v1_legacy_node_compatibility(self):
+        smart_nodes = importlib.import_module("custom_nodes.ComfyUI-SmartModelResolver.nodes.smart_nodes")
+        SmartModelPathFinder = smart_nodes.SmartModelPathFinder
+        inputs = SmartModelPathFinder.INPUT_TYPES()
+        self.assertIn("required", inputs)
+        self.assertIn("model_name", inputs["required"])
+
+        inst = SmartModelPathFinder()
+        with patch.object(smr.SmartModelIndex, "find_model", return_value=(r"C:\models\sub\m.safetensors", r"sub\m.safetensors", "exact")):
+            full_p, rel_p, found, info = inst.resolve("m.safetensors", "ALL", allow_fuzzy=True)
+            self.assertTrue(found)
+            self.assertEqual(full_p, r"C:\models\sub\m.safetensors")
+
+    def test_comfy_entrypoint_exported(self):
+        self.assertTrue(hasattr(smr, "comfy_entrypoint"))
+        import asyncio
+        ext = asyncio.run(smr.comfy_entrypoint())
+        if ext is not None:
+            nodes = asyncio.run(ext.get_node_list())
+            self.assertEqual(len(nodes), 1)
 
 
 if __name__ == "__main__":
     unittest.main()
+

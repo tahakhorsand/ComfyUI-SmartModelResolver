@@ -8,7 +8,7 @@ from server import PromptServer
 import folder_paths
 
 from .core.model_indexer import SmartModelIndex, VALID_MODEL_EXTENSIONS, GENERIC_SUFFIX_TOKENS
-from .nodes.smart_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .nodes.smart_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, comfy_entrypoint
 
 logger = logging.getLogger("SmartModelResolver")
 WEB_DIRECTORY = "./web"
@@ -471,4 +471,4 @@ if hasattr(PromptServer, "instance") and PromptServer.instance is not None:
 
 logger.info("★ ComfyUI-SmartModelResolver ready (Subfolder Auto-Fix + Interactive Model Suggestions + Live Cache Refresh)")
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY", "comfy_entrypoint"]
