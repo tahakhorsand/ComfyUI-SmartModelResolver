@@ -16,11 +16,11 @@ class SmartModelIndex:
     _instance = None
 
     def __init__(self):
-        self.cached_files_by_category: Dict[str, List[Tuple[str, str]]] = {}  # category -> list of (rel_path, full_path)
-        self.basename_to_paths: Dict[str, List[Tuple[str, str, str]]] = {}     # lower_basename -> list of (category, rel_path, full_path)
+        self.cached_files_by_category: Dict[str, List[str]] = {}  # category -> list of rel_paths
+        self.basename_to_paths: Dict[str, List[Tuple[str, str]]] = {}  # lower_basename -> list of (cat, rel_path)
         self.last_scan_time = 0.0
-        self.cache_ttl = 10.0  # seconds
-        self._dir_mtimes: Dict[str, float] = {}
+        self.cache_ttl = 120.0  # seconds
+        self._is_scanning = False
 
     @classmethod
     def get_instance(cls):
@@ -28,81 +28,61 @@ class SmartModelIndex:
             cls._instance = SmartModelIndex()
         return cls._instance
 
-    def _should_rescan(self, folder_paths) -> bool:
-        now = time.time()
-        if now - self.last_scan_time < self.cache_ttl:
-            return False
-
-        for cat, (paths, _) in folder_paths.folder_names_and_paths.items():
-            for p in paths:
-                if os.path.isdir(p):
-                    try:
-                        mtime = os.path.getmtime(p)
-                        if self._dir_mtimes.get(p) != mtime:
-                            return True
-                    except OSError:
-                        pass
-        return False
-
     def scan_all(self, folder_paths, force: bool = False):
-        if not force and not self._should_rescan(folder_paths) and self.cached_files_by_category:
+        now = time.time()
+        if not force and (now - self.last_scan_time < self.cache_ttl) and self.cached_files_by_category:
             return
+        if self._is_scanning:
+            return
+        self._is_scanning = True
 
-        t0 = time.time()
-        new_cached_files: Dict[str, List[Tuple[str, str]]] = {}
-        new_basename_to_paths: Dict[str, List[Tuple[str, str, str]]] = {}
-        new_dir_mtimes: Dict[str, float] = {}
+        try:
+            t0 = time.time()
+            new_cached_files: Dict[str, List[str]] = {}
+            new_basename_to_paths: Dict[str, List[Tuple[str, str]]] = {}
 
-        for cat, (paths, exts) in folder_paths.folder_names_and_paths.items():
-            cat_list = []
-            for root_dir in paths:
-                if not os.path.isdir(root_dir):
-                    continue
+            all_cats = list(getattr(folder_paths, "folder_names_and_paths", {}).keys())
+            for cat in all_cats:
                 try:
-                    new_dir_mtimes[root_dir] = os.path.getmtime(root_dir)
-                except OSError:
-                    pass
+                    files = folder_paths.get_filename_list(cat)
+                except Exception:
+                    continue
 
-                for dirpath, _, filenames in os.walk(root_dir, followlinks=True):
-                    for fname in filenames:
-                        ext = os.path.splitext(fname)[-1].lower()
-                        # Strictly enforce valid model extensions
-                        if ext not in VALID_MODEL_EXTENSIONS:
-                            continue
-                        if exts and ext not in exts and "" not in exts:
-                            continue
+                cat_list = []
+                for rel_p in files:
+                    ext = os.path.splitext(rel_p)[-1].lower()
+                    if ext not in VALID_MODEL_EXTENSIONS:
+                        continue
+                    norm_rel = rel_p.replace("\\", "/")
+                    cat_list.append(norm_rel)
+                    base_lower = os.path.basename(norm_rel).lower()
+                    if base_lower not in new_basename_to_paths:
+                        new_basename_to_paths[base_lower] = []
+                    new_basename_to_paths[base_lower].append((cat, norm_rel))
 
-                        full_p = os.path.join(dirpath, fname)
-                        try:
-                            rel_p = os.path.relpath(full_p, root_dir).replace("\\", "/")
-                        except ValueError:
-                            rel_p = fname
+                new_cached_files[cat] = cat_list
 
-                        cat_list.append((rel_p, full_p))
-                        base_lower = fname.lower()
-                        if base_lower not in new_basename_to_paths:
-                            new_basename_to_paths[base_lower] = []
-                        new_basename_to_paths[base_lower].append((cat, rel_p, full_p))
-
-            new_cached_files[cat] = cat_list
-
-        self.cached_files_by_category = new_cached_files
-        self.basename_to_paths = new_basename_to_paths
-        self._dir_mtimes = new_dir_mtimes
-        self.last_scan_time = time.time()
-        logger.info(f"[SmartModelResolver] Scanned & indexed {sum(len(v) for v in new_cached_files.values())} model files across {len(new_cached_files)} categories in {time.time()-t0:.2f}s")
+            self.cached_files_by_category = new_cached_files
+            self.basename_to_paths = new_basename_to_paths
+            self.last_scan_time = time.time()
+            total_count = sum(len(v) for v in new_cached_files.values())
+            logger.info(f"[SmartModelResolver] Fast-indexed {total_count} models across {len(new_cached_files)} categories in {time.time()-t0:.3f}s")
+        except Exception as e:
+            logger.error(f"[SmartModelResolver] Error during indexing: {e}")
+        finally:
+            self._is_scanning = False
 
     def find_model(self, folder_name: str, requested_name: str, folder_paths) -> Optional[Tuple[str, str, str]]:
         """
         Locates the exact same model file if present in subfolders or other categories.
         STRICT: Only matches the EXACT same basename.
+        Returns: (full_path, rel_path, match_type) or None
         """
         if not requested_name or not isinstance(requested_name, str):
             return None
 
         clean_req = requested_name.strip().replace("\\", "/")
         req_base = os.path.basename(clean_req).lower()
-
         req_ext = os.path.splitext(req_base)[-1].lower()
         if req_ext and req_ext not in VALID_MODEL_EXTENSIONS:
             return None
@@ -110,14 +90,29 @@ class SmartModelIndex:
         self.scan_all(folder_paths)
         folder_name = folder_paths.map_legacy(folder_name)
 
+        def _resolve_full(cat: str, rel: str) -> Optional[str]:
+            try:
+                p = folder_paths.get_full_path(cat, rel)
+                if p and (os.path.isfile(p) or os.path.islink(p)):
+                    return p
+            except Exception:
+                pass
+            return None
+
         # 1. Exact basename match
         if req_base in self.basename_to_paths:
             matches = self.basename_to_paths[req_base]
-            for cat, rel_p, full_p in matches:
+            # Prioritize target category
+            for cat, rel_p in matches:
                 if cat == folder_name:
-                    return full_p, rel_p, "exact_category_subfolder"
-            for cat, rel_p, full_p in matches:
-                return full_p, rel_p, f"cross_category_{cat}"
+                    full_p = _resolve_full(cat, rel_p)
+                    if full_p:
+                        return full_p, rel_p, "exact_category_subfolder"
+            # Cross-category fallback
+            for cat, rel_p in matches:
+                full_p = _resolve_full(cat, rel_p)
+                if full_p:
+                    return full_p, rel_p, f"cross_category_{cat}"
 
         # 2. Extension omitted in query
         if not req_ext:
@@ -125,17 +120,21 @@ class SmartModelIndex:
                 cand = f"{req_base}{ext}"
                 if cand in self.basename_to_paths:
                     matches = self.basename_to_paths[cand]
-                    for cat, rel_p, full_p in matches:
+                    for cat, rel_p in matches:
                         if cat == folder_name:
-                            return full_p, rel_p, "exact_category_subfolder"
-                    for cat, rel_p, full_p in matches:
-                        return full_p, rel_p, f"cross_category_{cat}"
+                            full_p = _resolve_full(cat, rel_p)
+                            if full_p:
+                                return full_p, rel_p, "exact_category_subfolder"
+                    for cat, rel_p in matches:
+                        full_p = _resolve_full(cat, rel_p)
+                        if full_p:
+                            return full_p, rel_p, f"cross_category_{cat}"
 
         return None
 
     def find_similar_model(self, folder_name: str, requested_name: str, folder_paths) -> Optional[Tuple[str, str, float]]:
         """
-        Looks for a genuine SIMILAR model candidate (e.g. 2509 vs 2511, or slightly different revision).
+        Looks for a genuine SIMILAR model candidate (e.g. pruned vs unpruned, int8 vs fp8, revision 2509 vs 2511).
         Strictly restricted to authentic model files in relevant categories.
         Returns (full_path, rel_path, similarity_score) or None.
         """
@@ -152,26 +151,24 @@ class SmartModelIndex:
         self.scan_all(folder_paths)
         folder_name = folder_paths.map_legacy(folder_name)
 
-        # Candidates to compare: prioritize same category
         candidates = []
         if folder_name in self.cached_files_by_category:
-            for rel_p, full_p in self.cached_files_by_category[folder_name]:
-                candidates.append((rel_p, full_p))
+            for rel_p in self.cached_files_by_category[folder_name]:
+                candidates.append((folder_name, rel_p))
 
-        # Also include diffusion_models / unet if relevant
+        # Also search in related model folders for diffusion/unet models
         if folder_name in ("unet", "diffusion_models"):
             for other_cat in ("diffusion_models", "unet", "checkpoints"):
                 if other_cat != folder_name and other_cat in self.cached_files_by_category:
-                    for rel_p, full_p in self.cached_files_by_category[other_cat]:
-                        candidates.append((rel_p, full_p))
+                    for rel_p in self.cached_files_by_category[other_cat]:
+                        candidates.append((other_cat, rel_p))
 
         best_candidate = None
         best_score = 0.0
 
-        # Tokenize requested name
         clean_req_tokens = set(re.findall(r'[a-zA-Z0-9]+', req_stem))
 
-        for rel_p, full_p in candidates:
+        for cat, rel_p in candidates:
             cand_base = os.path.basename(rel_p).lower()
             cand_stem, cand_ext = os.path.splitext(cand_base)
 
@@ -183,7 +180,6 @@ class SmartModelIndex:
                 continue
 
             cand_tokens = set(re.findall(r'[a-zA-Z0-9]+', cand_stem))
-            # Must share at least 2 common tokens or primary family prefix
             common = clean_req_tokens.intersection(cand_tokens)
             if len(common) < 2 and not (req_stem[:6] == cand_stem[:6] and len(req_stem) > 6):
                 continue
@@ -192,6 +188,10 @@ class SmartModelIndex:
             score = difflib.SequenceMatcher(None, req_stem, cand_stem).ratio()
             if score > best_score:
                 best_score = score
+                try:
+                    full_p = folder_paths.get_full_path(cat, rel_p)
+                except Exception:
+                    full_p = rel_p
                 best_candidate = (full_p, rel_p, score)
 
         if best_candidate and best_score >= 0.65:

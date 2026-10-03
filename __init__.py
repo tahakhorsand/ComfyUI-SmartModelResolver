@@ -1,4 +1,5 @@
 import os
+import threading
 import logging
 from aiohttp import web
 from server import PromptServer
@@ -14,9 +15,16 @@ WEB_DIRECTORY = "./web"
 _orig_get_full_path = folder_paths.get_full_path
 
 def smart_get_full_path(folder_name: str, filename: str):
+    if not filename or not isinstance(filename, str):
+        return _orig_get_full_path(folder_name, filename)
+
     path = _orig_get_full_path(folder_name, filename)
     if path and (os.path.isfile(path) or os.path.islink(path)):
         return path
+
+    ext = os.path.splitext(filename)[-1].lower()
+    if ext and ext not in VALID_MODEL_EXTENSIONS:
+        return None
 
     indexer = SmartModelIndex.get_instance()
     res = indexer.find_model(folder_name, filename, folder_paths)
@@ -28,6 +36,15 @@ def smart_get_full_path(folder_name: str, filename: str):
     return None
 
 folder_paths.get_full_path = smart_get_full_path
+
+# Pre-index in background daemon thread on startup so ComfyUI starts instantly
+def _warmup_indexer():
+    try:
+        SmartModelIndex.get_instance().scan_all(folder_paths)
+    except Exception as e:
+        logger.debug(f"[SmartModelResolver] Warmup scan info: {e}")
+
+threading.Thread(target=_warmup_indexer, daemon=True).start()
 
 # Register HTTP endpoint for Frontend Auto-Fixer & Suggestions
 async def _handle_resolve_batch_impl(request):
@@ -98,7 +115,9 @@ async def _handle_resolve_batch_impl(request):
             if matched_val and matched_val != current_val:
                 exact_resolved.append({
                     "nodeId": node_id,
+                    "nodeTitle": node_title,
                     "widgetName": widget_name,
+                    "originalValue": current_val,
                     "resolvedValue": matched_val,
                     "matchType": match_type
                 })
@@ -107,7 +126,6 @@ async def _handle_resolve_batch_impl(request):
                 sim_res = indexer.find_similar_model(cat_hint, current_val, folder_paths)
                 if sim_res:
                     full_p, rel_p, score = sim_res
-                    # Find matching representation in available_vals if available
                     cand_base = os.path.basename(rel_p).lower()
                     final_cand = rel_p
                     for opt in available_vals:
