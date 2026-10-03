@@ -13,7 +13,9 @@ Repository = "https://github.com/tahakhorsand/ComfyUI-SmartModelResolver"
 Issues = "https://github.com/tahakhorsand/ComfyUI-SmartModelResolver/issues"
 
 [tool.comfy]
-PublisherId = "tahakhorsand"
+PublisherId = "taha"
 DisplayName = "ComfyUI-SmartModelResolver"
 Icon = ""
+includes = ["web", "core", "nodes", "assets"]
+
 
