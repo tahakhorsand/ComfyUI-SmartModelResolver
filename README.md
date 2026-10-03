@@ -9,13 +9,9 @@ Eliminates workflow loading failures, missing subfolder paths, and red widget er
 ## ✨ Features
 
 - **🔍 Automatic Subfolder Resolution**:
-  Seamlessly maps models saved without subfolders (e.g. `marigold_v2_normals.safetensors`) to their actual local path (e.g. `marigold/marigold_v2_normals.safetensors`).
+  Seamlessly maps models saved without subfolders
 - **💡 Smart Model Suggestions**:
   When a workflow requests a model you do not have (e.g. `minimax_h3_ref2va_pruned...`), the extension locates authentic alternatives in your library (e.g. `minimax_h3_ref2va...` with 90%+ match) and asks you politely via a sleek notification card.
-- **🚫 Zero Workflow Blocking**:
-  No invasive modal windows or blocking overlays. All notifications float non-intrusively in the top corner with `pointer-events: none` on the backdrop, keeping your canvas completely interactive.
-- **🪟 Modern Glassmorphic Design**:
-  Translucent glass cards with backdrop blur, glowing cyan accents, and clear status badges.
 - **🧩 Full Subgraph / Group Node Support**:
   Recursively traverses both root graphs and inner subgraphs, keeping promoted inputs and internal definitions perfectly in sync.
 - **🛡️ Strict Model File Protection**:
