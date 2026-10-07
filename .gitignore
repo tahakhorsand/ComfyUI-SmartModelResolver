@@ -28,5 +28,12 @@ node.zip
 *.tar.gz
 
 
+# Local scripts and tooling
+*.bat
+*.cmd
+*.ps1
+*.sh
+
 # Ruff
 .ruff_cache/
+
