@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-smartmodelresolver"
 description = "Intelligent subfolder auto-linker and model replacement suggestion assistant for ComfyUI."
-version = "1.0.4"
+version = "1.0.5"
 license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.10"
 authors = [{ name = "Taha Khorsand" }]

@@ -22,13 +22,19 @@ GENERIC_SUFFIX_TOKENS: Set[str] = {
 }
 
 KNOWN_MODEL_FAMILIES = [
-    'gemma', 'qwen', 'flux', 'ltx', 'sdxl', 'sd', 'hunyuan', 'wan',
-    'minimax', 'cogvideo', 'mochi', 'aura', 'kolors', 't5', 'clip',
+    'gemma', 'qwen', 'flux', 'ltx', 'sdxl', 'sd15', 'sd21', 'sd1', 'sd2', 'sd35', 'sd3', 'sd',
+    'hunyuan', 'wan', 'minimax', 'cogvideo', 'mochi', 'aura', 'kolors', 't5', 'clip',
     'siglip', 'eva02', 'vit', 'chameleon', 'deepseek', 'llama', 'mistral'
 ]
 
 def extract_semantic_features(name: str) -> dict:
     name_clean = re.sub(r'\.(safetensors|ckpt|pt|pth|bin|sft|onnx|gguf)$', '', name.lower())
+    name_clean = re.sub(r'sd[-_]xl', 'sdxl', name_clean)
+    name_clean = re.sub(r'sd[-_]?1[-_]?5', 'sd15', name_clean)
+    name_clean = re.sub(r'sd[-_]?2[-_]?1', 'sd21', name_clean)
+    name_clean = re.sub(r'sd[-_]?3[-_]?5', 'sd35', name_clean)
+    name_clean = re.sub(r'sd[-_]?3', 'sd3', name_clean)
+
     raw_tokens = re.split(r'[-_.\s/]+', name_clean)
     tokens = [t for t in raw_tokens if t]
 
@@ -43,7 +49,7 @@ def extract_semantic_features(name: str) -> dict:
 
         found_fam = False
         for kf in KNOWN_MODEL_FAMILIES:
-            if t.startswith(kf) or kf in t:
+            if t == kf or t.startswith(kf) or (len(kf) >= 3 and kf in t):
                 families.add(kf)
                 found_fam = True
                 break
@@ -77,13 +83,13 @@ def calculate_model_similarity(req_name: str, cand_name: str) -> float:
     if not fam_match:
         return seq_score if seq_score >= 0.65 else 0.0
 
-    score = 0.50
+    score = 0.58
 
     if req_f['sizes'] and cand_f['sizes']:
         if req_f['sizes'].intersection(cand_f['sizes']):
-            score += 0.25
+            score += 0.20
         else:
-            score -= 0.10
+            score -= 0.05
     elif not req_f['sizes'] and not cand_f['sizes']:
         score += 0.08
 
@@ -91,7 +97,7 @@ def calculate_model_similarity(req_name: str, cand_name: str) -> float:
     if all_content:
         common_content = req_f['content_tokens'].intersection(cand_f['content_tokens'])
         jaccard = len(common_content) / len(all_content)
-        score += jaccard * 0.20
+        score += jaccard * 0.15
 
     score += seq_score * 0.15
     return min(0.99, max(0.0, score))
@@ -298,7 +304,7 @@ class SmartModelIndex:
                 continue
 
             score = calculate_model_similarity(req_base, cand_base)
-            if score >= 0.58:
+            if score >= 0.55:
                 try:
                     full_p = folder_paths.get_full_path(cat, rel_p)
                 except Exception:
