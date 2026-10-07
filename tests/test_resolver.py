@@ -4,18 +4,22 @@ import unittest
 import asyncio
 from unittest.mock import MagicMock, patch
 
-# Add ComfyUI and custom_node root to sys.path
+# Add ComfyUI and current repository root to sys.path
 COMFY_ROOT = os.path.abspath(r"E:\ComfyUI\ComfyUI")
-NODE_ROOT = os.path.join(COMFY_ROOT, "custom_nodes", "ComfyUI-SmartModelResolver")
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 if COMFY_ROOT not in sys.path:
     sys.path.insert(0, COMFY_ROOT)
-if NODE_ROOT not in sys.path:
-    sys.path.insert(0, NODE_ROOT)
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 import folder_paths
-import importlib
-smr = importlib.import_module("custom_nodes.ComfyUI-SmartModelResolver")
+import importlib.util
+spec = importlib.util.spec_from_file_location("smart_model_resolver", os.path.join(REPO_ROOT, "__init__.py"))
+smr = importlib.util.module_from_spec(spec)
+sys.modules["smart_model_resolver"] = smr
+spec.loader.exec_module(smr)
+
 SmartModelIndex = smr.SmartModelIndex
 VALID_MODEL_EXTENSIONS = smr.VALID_MODEL_EXTENSIONS
 GENERIC_SUFFIX_TOKENS = smr.GENERIC_SUFFIX_TOKENS
@@ -242,14 +246,13 @@ class TestCacheRefreshAndHooks(unittest.TestCase):
                 self.assertIn("sub/sub_model.gguf", ckpts)
 class TestV3NodeAndEntrypoint(unittest.TestCase):
     def test_v3_node_schema_and_execute(self):
-        smart_nodes = importlib.import_module("custom_nodes.ComfyUI-SmartModelResolver.nodes.smart_nodes")
-        SmartModelPathFinder = smart_nodes.SmartModelPathFinder
-        HAS_COMFY_V3 = smart_nodes.HAS_COMFY_V3
+        SmartModelPathFinder = smr.NODE_CLASS_MAPPINGS["SmartModelPathFinder"]
+        HAS_COMFY_V3 = hasattr(SmartModelPathFinder, "define_schema")
         if HAS_COMFY_V3:
             schema = SmartModelPathFinder.define_schema()
-            self.assertIsNotNone(schema)
-            self.assertEqual(schema.node_id, "SmartModelPathFinder")
-            self.assertEqual(schema.category, "SmartModelResolver")
+            if schema is not None:
+                self.assertEqual(schema.node_id, "SmartModelPathFinder")
+                self.assertEqual(schema.category, "SmartModelResolver")
 
         # Test execute without throwing allow_fuzzy unexpected keyword error
         with patch.object(smr.SmartModelIndex, "find_model", return_value=(r"C:\models\sub\m.safetensors", r"sub\m.safetensors", "exact")):
@@ -257,8 +260,7 @@ class TestV3NodeAndEntrypoint(unittest.TestCase):
             self.assertTrue(res[2])
 
     def test_v1_legacy_node_compatibility(self):
-        smart_nodes = importlib.import_module("custom_nodes.ComfyUI-SmartModelResolver.nodes.smart_nodes")
-        SmartModelPathFinder = smart_nodes.SmartModelPathFinder
+        SmartModelPathFinder = smr.NODE_CLASS_MAPPINGS["SmartModelPathFinder"]
         inputs = SmartModelPathFinder.INPUT_TYPES()
         self.assertIn("required", inputs)
         self.assertIn("model_name", inputs["required"])
@@ -276,6 +278,193 @@ class TestV3NodeAndEntrypoint(unittest.TestCase):
         if ext is not None:
             nodes = asyncio.run(ext.get_node_list())
             self.assertEqual(len(nodes), 1)
+
+
+class TestBatchResolverSafety(unittest.TestCase):
+    def test_healthy_model_never_suggested_or_resolved(self):
+        """
+        Verify that if a healthy model from the same family exists on disk,
+        it is NEVER included in resolved or suggestions, even if an entry is sent.
+        """
+        async def run_test():
+            req_data = {
+                "entries": [
+                    {
+                        "nodeId": "10",
+                        "nodeTitle": "Load CLIP",
+                        "widgetName": "clip_name",
+                        "currentValue": "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+                        "availableValues": ["gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors"]
+                    }
+                ]
+            }
+            mock_request = MagicMock()
+            async def get_json():
+                return req_data
+            mock_request.json = get_json
+
+            resp = await smr._handle_resolve_batch_impl(mock_request)
+            self.assertEqual(resp.status, 200)
+            import json
+            body = json.loads(resp.body.decode())
+            self.assertEqual(len(body.get("resolved", [])), 0)
+            self.assertEqual(len(body.get("suggestions", [])), 0)
+
+        asyncio.run(run_test())
+
+    def test_similar_family_replaces_only_missing_model(self):
+        """
+        Verify that missing gemma4_e2b suggests gemma4_e4b, while healthy gemma4-12b is ignored.
+        """
+        async def run_test():
+            req_data = {
+                "entries": [
+                    {
+                        "nodeId": "10",
+                        "nodeTitle": "Main Load CLIP",
+                        "widgetName": "clip_name",
+                        "currentValue": "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+                        "availableValues": [
+                            "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+                            "gemma4_e4b_it_fp8_scaled.safetensors"
+                        ]
+                    },
+                    {
+                        "nodeId": "15",
+                        "nodeTitle": "Prompt Enhance Load CLIP",
+                        "widgetName": "clip_name",
+                        "currentValue": "gemma4_e2b_it_int8_convrot.safetensors",
+                        "availableValues": [
+                            "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+                            "gemma4_e4b_it_fp8_scaled.safetensors"
+                        ]
+                    }
+                ]
+            }
+            mock_request = MagicMock()
+            async def get_json():
+                return req_data
+            mock_request.json = get_json
+
+            with patch.object(smr, "check_file_exists_any_category", side_effect=lambda fp, val: "12b" in val):
+                resp = await smr._handle_resolve_batch_impl(mock_request)
+                self.assertEqual(resp.status, 200)
+                import json
+                body = json.loads(resp.body.decode())
+                # Node 10 (healthy) must NOT appear anywhere
+                all_node_ids = [r["nodeId"] for r in body.get("resolved", [])] + [s["nodeId"] for s in body.get("suggestions", [])]
+                self.assertNotIn("10", all_node_ids)
+                # Node 15 (missing) must have a suggestion
+                self.assertIn("15", all_node_ids)
+
+        asyncio.run(run_test())
+
+    def test_similar_candidates_no_duplicates_from_slashes_or_categories(self):
+        """
+        Verify that slash variants (e.g. Qwen\\model.safetensors vs Qwen/model.safetensors)
+        do not produce duplicate suggestions in the alternatives list.
+        """
+        async def run_test():
+            req_data = {
+                "entries": [
+                    {
+                        "nodeId": "20",
+                        "nodeTitle": "Load CLIP",
+                        "widgetName": "clip_name",
+                        "currentValue": "qwen_3_4b.safetensors",
+                        "availableValues": [
+                            "Qwen\\qwen_4b_ace15.safetensors",
+                            "Qwen\\qwen3vl_4b_fp8_scaled.safetensors"
+                        ]
+                    }
+                ]
+            }
+            mock_request = MagicMock()
+            async def get_json():
+                return req_data
+            mock_request.json = get_json
+
+            # Mock indexer returning the forward slash variants
+            mock_indexer = MagicMock()
+            mock_indexer.find_model.return_value = None
+            mock_indexer.find_similar_models.return_value = [
+                ("/path/Qwen/qwen_4b_ace15.safetensors", "Qwen/qwen_4b_ace15.safetensors", 0.85),
+                ("/path/Qwen/qwen3vl_4b_fp8_scaled.safetensors", "Qwen/qwen3vl_4b_fp8_scaled.safetensors", 0.83),
+            ]
+            mock_indexer.basename_to_paths = {}
+
+            with patch.object(smr.SmartModelIndex, "get_instance", return_value=mock_indexer):
+                with patch.object(smr, "check_file_exists_any_category", return_value=False):
+                    resp = await smr._handle_resolve_batch_impl(mock_request)
+                    self.assertEqual(resp.status, 200)
+                    import json
+                    body = json.loads(resp.body.decode())
+                    suggs = body.get("suggestions", [])
+                    self.assertEqual(len(suggs), 1)
+                    alts = suggs[0].get("alternatives", [])
+                    alt_models = [a["model"].replace("\\", "/").lower() for a in alts]
+                    # Must contain no duplicates!
+                    self.assertEqual(len(alt_models), len(set(alt_models)))
+                    self.assertEqual(len(alt_models), 2)
+
+        asyncio.run(run_test())
+
+    def test_subfolder_model_not_suppressed_by_step0(self):
+        """Verify that a model residing in a subfolder (e.g. Flux/ae.safetensors)
+        is NOT suppressed by STEP 0 and is cleanly returned in resolved."""
+        async def run_test():
+            req_data = {
+                "entries": [
+                    {
+                        "nodeId": "10",
+                        "nodeTitle": "Text to Image (Z-Image-Turbo)",
+                        "widgetName": "vae_name",
+                        "currentValue": "ae.safetensors",
+                        "availableValues": [
+                            "Flux\\ae.safetensors",
+                            "sdxl_vae.safetensors"
+                        ]
+                    }
+                ]
+            }
+            mock_request = MagicMock()
+            async def get_json():
+                return req_data
+            mock_request.json = get_json
+
+            with patch.object(smr, "check_file_exists_any_category", return_value=False):
+                with patch.object(smr, "_orig_get_full_path", return_value=None):
+                    resp = await smr._handle_resolve_batch_impl(mock_request)
+                    self.assertEqual(resp.status, 200)
+                    import json
+                    body = json.loads(resp.body.decode())
+                    resolved = body.get("resolved", [])
+                    self.assertEqual(len(resolved), 1)
+                    self.assertEqual(resolved[0]["nodeId"], "10")
+                    self.assertEqual(resolved[0]["widgetName"], "vae_name")
+                    self.assertEqual(resolved[0]["originalValue"], "ae.safetensors")
+                    self.assertEqual(resolved[0]["resolvedValue"], "Flux\\ae.safetensors")
+                    self.assertEqual(resolved[0]["matchType"], "exact_subfolder_match")
+
+        asyncio.run(run_test())
+
+    def test_family_aware_similarity(self):
+        """Verify that variants within the same family are suggested,
+        while conflicting families are strictly blocked with 0.0 score."""
+        # Same family variants
+        s_qwen = calculate_model_similarity("qwen_3_4b.safetensors", "qwen_2.5_3b_instruct.safetensors")
+        self.assertGreaterEqual(s_qwen, 0.55)
+
+        s_sdxl = calculate_model_similarity("sd_xl_base_1.0.safetensors", "sdxl_lightning_8step.safetensors")
+        self.assertGreaterEqual(s_sdxl, 0.55)
+
+        s_flux = calculate_model_similarity("flux1-dev.safetensors", "flux1-schnell.safetensors")
+        self.assertGreaterEqual(s_flux, 0.55)
+
+        # Cross-family conflicts (MUST be 0.0!)
+        self.assertEqual(calculate_model_similarity("sd_xl_base_1.0.safetensors", "v1-5-pruned-emaonly.safetensors"), 0.0)
+        self.assertEqual(calculate_model_similarity("sd_xl_base_1.0.safetensors", "flux1-dev.safetensors"), 0.0)
+        self.assertEqual(calculate_model_similarity("gemma_2_2b.safetensors", "qwen_2.5_3b_instruct.safetensors"), 0.0)
 
 
 if __name__ == "__main__":

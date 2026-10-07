@@ -27,3 +27,6 @@ node.zip
 *.zip
 *.tar.gz
 
+
+# Ruff
+.ruff_cache/

@@ -71,7 +71,7 @@ def smart_get_full_path(folder_name: str, filename: str):
     # 3. SmartModelIndex subfolder / cross-category resolution
     indexer = SmartModelIndex.get_instance()
     res = indexer.find_model(folder_name, filename, folder_paths)
-    if res:
+    if res and isinstance(res, (tuple, list)) and len(res) == 3:
         full_p, rel_p, match_type = res
         logger.info(f"[SmartModelResolver] Auto-located exact model: '{filename}' in '{folder_name}' -> '{full_p}' ({match_type})")
         return full_p
@@ -283,6 +283,25 @@ async def _handle_resolve_batch_impl(request):
             if req_ext and req_ext not in VALID_MODEL_EXTENSIONS:
                 continue
 
+            # Contextual category detection from both widget name and node title
+            context = f"{widget_name} {node_title}".lower()
+            if "lora" in context:
+                cat_hint = "loras"
+            elif "unet" in context or "diffusion" in context:
+                cat_hint = "diffusion_models"
+            elif "vae" in context:
+                cat_hint = "vae"
+            elif any(k in context for k in ["clip", "text_encoder", "conditioning", "t5", "gemma", "prompt", "enhance", "llm"]):
+                cat_hint = "text_encoders"
+            elif "controlnet" in context:
+                cat_hint = "controlnet"
+            elif "upscale" in context:
+                cat_hint = "upscale_models"
+            else:
+                cat_hint = "checkpoints"
+
+            target_cat = folder_paths.map_legacy(cat_hint) if hasattr(folder_paths, "map_legacy") else cat_hint
+
             # -------------------------------------------------------------
             # STEP 0: Check if this model ALREADY exists physically on disk!
             # If current_val is already at the requested path, it is NOT missing!
@@ -305,29 +324,16 @@ async def _handle_resolve_batch_impl(request):
             if not already_exists and check_file_exists_any_category(folder_paths, current_val):
                 already_exists = True
 
+            # Standard ComfyUI get_full_path check (exact relative path only, NOT fuzzy subfolder search)
+            if not already_exists:
+                p = _orig_get_full_path("", current_val) or _orig_get_full_path(target_cat, current_val)
+                if p and (os.path.isfile(p) or os.path.islink(p)):
+                    already_exists = True
+
             if already_exists:
                 # Model is present on disk at this exact relative path.
                 # DO NOT TOUCH IT! DO NOT SUGGEST REPLACING IT!
                 continue
-
-            # Contextual category detection from both widget name and node title
-            context = f"{widget_name} {node_title}".lower()
-            if "lora" in context:
-                cat_hint = "loras"
-            elif "unet" in context or "diffusion" in context:
-                cat_hint = "diffusion_models"
-            elif "vae" in context:
-                cat_hint = "vae"
-            elif any(k in context for k in ["clip", "text_encoder", "conditioning", "t5", "gemma", "prompt", "enhance", "llm"]):
-                cat_hint = "text_encoders"
-            elif "controlnet" in context:
-                cat_hint = "controlnet"
-            elif "upscale" in context:
-                cat_hint = "upscale_models"
-            else:
-                cat_hint = "checkpoints"
-
-            target_cat = folder_paths.map_legacy(cat_hint) if hasattr(folder_paths, "map_legacy") else cat_hint
 
             # -------------------------------------------------------------
             # STEP 1: Exact model exists on disk, but in a SUBFOLDER!
@@ -389,32 +395,57 @@ async def _handle_resolve_batch_impl(request):
             # -------------------------------------------------------------
             from .core.model_indexer import calculate_model_similarity
 
-            candidates_map = {}  # opt_path -> score
+            # Normalized deduplicated candidate map: norm_path -> (preferred_opt, score)
+            candidates_map = {}
+
+            def _add_candidate(cand_path: str, score: float):
+                if not cand_path or not isinstance(cand_path, str):
+                    return
+                cand_norm = cand_path.replace("\\", "/").strip()
+                cand_key = cand_norm.lower()
+                if cand_key == clean_val_lower:
+                    return
+                if cand_key in candidates_map:
+                    prev_path, prev_score = candidates_map[cand_key]
+                    if score > prev_score:
+                        candidates_map[cand_key] = (prev_path, score)
+                else:
+                    candidates_map[cand_key] = (cand_path, score)
 
             # 2a. Check available options in widget
             if available_vals:
                 for opt in available_vals:
+                    if not isinstance(opt, str):
+                        continue
                     opt_norm = opt.replace("\\", "/")
                     opt_base = os.path.basename(opt_norm).lower()
                     opt_s, opt_e = os.path.splitext(opt_base)
                     if opt_e not in VALID_MODEL_EXTENSIONS or opt_base == req_base:
                         continue
                     score = calculate_model_similarity(req_base, opt_base)
-                    if score >= 0.58:
-                        candidates_map[opt] = max(candidates_map.get(opt, 0.0), score)
+                    if score >= 0.55:
+                        _add_candidate(opt, score)
 
             # 2b. Also search indexed disk models in the same category to guarantee fresh candidates
             try:
                 sim_list = indexer.find_similar_models(cat_hint, current_val, folder_paths, top_k=5)
                 for full_p, rel_p, score in sim_list:
-                    if score >= 0.58:
-                        candidates_map[rel_p] = max(candidates_map.get(rel_p, 0.0), score)
+                    if score >= 0.55:
+                        # Prefer option string from available_vals if it matches
+                        rel_norm = rel_p.replace("\\", "/").lower()
+                        matching_opt = None
+                        if available_vals:
+                            for av in available_vals:
+                                if isinstance(av, str) and av.replace("\\", "/").lower() == rel_norm:
+                                    matching_opt = av
+                                    break
+                        cand_to_add = matching_opt if matching_opt else rel_p
+                        _add_candidate(cand_to_add, score)
             except Exception:
                 pass
 
             if candidates_map:
-                sorted_cands = sorted(candidates_map.items(), key=lambda x: x[1], reverse=True)
-                # Filter out anything that matches current_val
+                sorted_cands = sorted(candidates_map.values(), key=lambda x: x[1], reverse=True)
                 valid_cands = [
                     (opt, sc) for opt, sc in sorted_cands
                     if opt.replace("\\", "/").lower() != clean_val_lower

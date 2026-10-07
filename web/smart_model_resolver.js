@@ -389,6 +389,230 @@ app.registerExtension({
             return result;
         }
 
+        // Helper: Find the exact promoted widget on parentNode that corresponds to childNode's widget
+        function findCorrespondingParentWidget(parentNode, childNode, childWidget, oldVal) {
+            if (!parentNode) return null;
+            const childIdStr = String(childNode.id);
+            const childWidgetName = childWidget.name;
+
+            // 1. Direct Promoted Widget View (Modern ComfyUI Subgraph)
+            // In modern ComfyUI, promoted widgets on the Subgraph node store sourceNodeId and sourceWidgetName:
+            if (parentNode.widgets) {
+                for (const pw of parentNode.widgets) {
+                    const srcNodeId = pw.sourceNodeId !== undefined ? String(pw.sourceNodeId) :
+                                     (pw.disambiguatingSourceNodeId !== undefined ? String(pw.disambiguatingSourceNodeId) : null);
+                    if (srcNodeId === childIdStr && (pw.sourceWidgetName === childWidgetName || pw.name === childWidgetName)) {
+                        return pw;
+                    }
+                }
+            }
+
+            // 2. Subgraph Input links (from inputNode -10 to childNode)
+            if (parentNode.subgraph) {
+                const sg = parentNode.subgraph;
+                const links = sg.links;
+                const matchedOriginSlots = new Set();
+
+                const checkLink = (link) => {
+                    if (!link) return false;
+                    if (String(link.target_id) !== childIdStr) return false;
+                    const targetSlot = link.target_slot;
+                    if (childNode.inputs && childNode.inputs[targetSlot]) {
+                        const targetInput = childNode.inputs[targetSlot];
+                        const inpWidgetName = targetInput.widget?.name || targetInput.name;
+                        if (inpWidgetName === childWidgetName) return true;
+                    }
+                    return true;
+                };
+
+                if (links) {
+                    if (links instanceof Map) {
+                        for (const link of links.values()) {
+                            if (checkLink(link) && link.origin_slot !== undefined) {
+                                matchedOriginSlots.add(link.origin_slot);
+                            }
+                        }
+                    } else if (Array.isArray(links)) {
+                        for (const link of links) {
+                            if (checkLink(link) && link.origin_slot !== undefined) {
+                                matchedOriginSlots.add(link.origin_slot);
+                            }
+                        }
+                    } else if (typeof links === "object") {
+                        for (const k in links) {
+                            const link = links[k];
+                            if (checkLink(link) && link.origin_slot !== undefined) {
+                                matchedOriginSlots.add(link.origin_slot);
+                            }
+                        }
+                    }
+                }
+
+                // Check sg.inputs linkIds definition as well
+                if (sg.inputs && Array.isArray(sg.inputs)) {
+                    for (let slotIdx = 0; slotIdx < sg.inputs.length; slotIdx++) {
+                        const sDef = sg.inputs[slotIdx];
+                        if (sDef && sDef.linkIds) {
+                            for (const lid of sDef.linkIds) {
+                                const link = (links instanceof Map) ? links.get(lid) : (links ? links[lid] : null);
+                                if (link && String(link.target_id) === childIdStr) {
+                                    matchedOriginSlots.add(slotIdx);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (const slotIdx of matchedOriginSlots) {
+                    // Check parentNode.inputs[slotIdx]
+                    if (parentNode.inputs && parentNode.inputs[slotIdx]) {
+                        const pinp = parentNode.inputs[slotIdx];
+                        if (parentNode.widgets) {
+                            const pwMatch = parentNode.widgets.find(pw =>
+                                pw === pinp.widget ||
+                                (pinp.widget && pw.name === pinp.widget.name) ||
+                                (pinp.label && pw.name === pinp.label) ||
+                                (pinp.name && pw.name === pinp.name)
+                            );
+                            if (pwMatch) return pwMatch;
+                        }
+                    }
+                    // Check sg.inputs[slotIdx]
+                    if (sg.inputs && sg.inputs[slotIdx] && parentNode.widgets) {
+                        const sDef = sg.inputs[slotIdx];
+                        const pwMatch = parentNode.widgets.find(pw =>
+                            (sDef.label && pw.name === sDef.label) ||
+                            (sDef.name && pw.name === sDef.name)
+                        );
+                        if (pwMatch) return pwMatch;
+                    }
+                }
+            }
+
+            // 3. ComfyUI GroupNode (Legacy/Deprecated GroupNode)
+            const groupData = parentNode.groupData || parentNode.constructor?.nodeData?.["Comfy.GroupNode"];
+            if (groupData) {
+                const innerNodes = parentNode.innerNodes || parentNode.getInnerNodes?.() || groupData.nodeData?.nodes;
+                let innerIdx = -1;
+                if (Array.isArray(innerNodes)) {
+                    innerIdx = innerNodes.findIndex(n => String(n.id) === childIdStr);
+                }
+                if (innerIdx >= 0) {
+                    const promotedName = groupData.oldToNewWidgetMap?.[innerIdx]?.[childWidgetName];
+                    if (promotedName && parentNode.widgets) {
+                        const pw = parentNode.widgets.find(x => x.name === promotedName);
+                        if (pw) return pw;
+                    }
+                }
+                if (groupData.newToOldWidgetMap && parentNode.widgets) {
+                    for (const pw of parentNode.widgets) {
+                        const mapInfo = groupData.newToOldWidgetMap[pw.name];
+                        if (mapInfo && mapInfo.node && mapInfo.inputName === childWidgetName) {
+                            if (innerIdx >= 0 && mapInfo.node.index === innerIdx) {
+                                return pw;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. Strict Fallback: ONLY when NO link metadata or groupData exists anywhere on parentNode
+            // AND the parent widget's value EXACTLY matches oldVal (ignoring slash/case).
+            // NEVER match by widget name alone!
+            const hasMetadata = !!(parentNode.subgraph || groupData);
+            if (!hasMetadata && parentNode.widgets && oldVal) {
+                const oldNorm = String(oldVal).replace(/\\/g, "/").toLowerCase();
+                const matchingWidgets = parentNode.widgets.filter(pw => {
+                    const pwNorm = String(pw.value).replace(/\\/g, "/").toLowerCase();
+                    return pw.value === oldVal || pwNorm === oldNorm;
+                });
+                if (matchingWidgets.length === 1) {
+                    return matchingWidgets[0];
+                }
+            }
+
+            return null;
+        }
+
+        // Helper: Find the exact input on parentNode corresponding to childNode's widget
+        function findCorrespondingParentInput(parentNode, childNode, childWidget, pw) {
+            if (!parentNode || !parentNode.inputs) return null;
+            const childIdStr = String(childNode.id);
+            const childWidgetName = childWidget.name;
+
+            // 1. If pw is known, match input associated with pw
+            if (pw) {
+                const inpByPw = parentNode.inputs.find(inp =>
+                    inp.widget === pw ||
+                    (inp.widget && inp.widget.name === pw.name) ||
+                    (inp.label && inp.label === pw.name) ||
+                    inp.name === pw.name
+                );
+                if (inpByPw) return inpByPw;
+            }
+
+            // 2. Direct promoted widget view on input._widget or input.widget
+            for (const inp of parentNode.inputs) {
+                const wObj = inp._widget || inp.widget;
+                if (wObj) {
+                    const srcNodeId = wObj.sourceNodeId !== undefined ? String(wObj.sourceNodeId) :
+                                     (wObj.disambiguatingSourceNodeId !== undefined ? String(wObj.disambiguatingSourceNodeId) : null);
+                    if (srcNodeId === childIdStr && (wObj.sourceWidgetName === childWidgetName || wObj.name === childWidgetName)) {
+                        return inp;
+                    }
+                }
+            }
+
+            // 3. Subgraph links from inputNode (-10) to childNode
+            if (parentNode.subgraph) {
+                const sg = parentNode.subgraph;
+                const links = sg.links;
+                if (links) {
+                    const checkLink = (link) => {
+                        if (!link) return false;
+                        if (String(link.target_id) !== childIdStr) return false;
+                        const targetSlot = link.target_slot;
+                        if (childNode.inputs && childNode.inputs[targetSlot]) {
+                            const targetInput = childNode.inputs[targetSlot];
+                            const inpWidgetName = targetInput.widget?.name || targetInput.name;
+                            if (inpWidgetName === childWidgetName) return true;
+                        }
+                        return true;
+                    };
+
+                    let matchedSlot = -1;
+                    if (links instanceof Map) {
+                        for (const link of links.values()) {
+                            if (checkLink(link) && link.origin_slot !== undefined) {
+                                matchedSlot = link.origin_slot;
+                                break;
+                            }
+                        }
+                    } else if (Array.isArray(links)) {
+                        for (const link of links) {
+                            if (checkLink(link) && link.origin_slot !== undefined) {
+                                matchedSlot = link.origin_slot;
+                                break;
+                            }
+                        }
+                    } else if (typeof links === "object") {
+                        for (const k in links) {
+                            if (checkLink(links[k]) && links[k].origin_slot !== undefined) {
+                                matchedSlot = links[k].origin_slot;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (matchedSlot >= 0 && parentNode.inputs[matchedSlot]) {
+                        return parentNode.inputs[matchedSlot];
+                    }
+                }
+            }
+
+            return null;
+        }
+
         // Apply a single widget update cleanly across leaf node & parent subgraph wrappers
         function applyWidgetUpdate(allNodeEntries, nodeId, widgetName, newValue) {
             const targetIdStr = String(nodeId);
@@ -400,8 +624,8 @@ app.registerExtension({
             }
 
             const parentChain = entry ? (entry.parentChain || []) : [];
-            const w = (node.widgets && node.widgets.find(x => x.name === widgetName)) ||
-                      (node.widgets && node.widgets.find(x => typeof x.value === "string" && (x.value.includes("/") || x.value.includes("\\"))));
+            // STRICT widget matching on target node: NEVER fallback to arbitrary slash widgets!
+            const w = node.widgets ? node.widgets.find(x => x.name === widgetName) : null;
             if (!w) {
                 console.warn(`[SmartModelResolver] Widget "${widgetName}" not found on node #${nodeId}.`);
                 return false;
@@ -474,58 +698,62 @@ app.registerExtension({
             }
 
             // 4. Update parent Subgraph / GroupNode promoted inputs and widgets across full parentChain
-            for (const parentNode of parentChain) {
-                if (!parentNode || !parentNode.widgets) continue;
-                for (const pw of parentNode.widgets) {
-                    const pwNorm = String(pw.value).replace(/\\/g, "/").toLowerCase();
-                    const oldNorm = String(oldVal).replace(/\\/g, "/").toLowerCase();
-                    if (pw.name === w.name || pw.value === oldVal || pwNorm === oldNorm) {
-                        if (pw.options && Array.isArray(pw.options.values)) {
-                            const valUnix = String(exactValue).replace(/\\/g, "/");
-                            const valWin = String(exactValue).replace(/\//g, "\\");
-                            if (!pw.options.values.includes(exactValue)) pw.options.values.push(exactValue);
-                            if (!pw.options.values.includes(valUnix)) pw.options.values.push(valUnix);
-                            if (!pw.options.values.includes(valWin)) pw.options.values.push(valWin);
-                        }
-                        const pOldVal = pw.value;
-                        pw.value = exactValue;
+            // Traverse from innermost parent to outermost parent cleanly
+            let currentChildNode = node;
+            let currentChildWidget = w;
 
-                        const pwIdx = parentNode.widgets.indexOf(pw);
-                        if (Array.isArray(parentNode.widgets_values)) {
-                            if (pwIdx >= 0 && pwIdx < parentNode.widgets_values.length) {
-                                parentNode.widgets_values[pwIdx] = exactValue;
-                            }
-                        } else if (parentNode.widgets_values && typeof parentNode.widgets_values === "object") {
-                            parentNode.widgets_values[pw.name] = exactValue;
-                        }
-                        if (parentNode.widgets_values_named) {
-                            parentNode.widgets_values_named[pw.name] = exactValue;
-                        }
+            for (let i = parentChain.length - 1; i >= 0; i--) {
+                const parentNode = parentChain[i];
+                if (!parentNode) continue;
 
-                        if (pw.callback) {
-                            try { pw.callback(pw.value); } catch (e) {}
+                const pw = findCorrespondingParentWidget(parentNode, currentChildNode, currentChildWidget, oldVal);
+                if (pw) {
+                    if (pw.options && Array.isArray(pw.options.values)) {
+                        const valUnix = String(exactValue).replace(/\\/g, "/");
+                        const valWin = String(exactValue).replace(/\//g, "\\");
+                        if (!pw.options.values.includes(exactValue)) pw.options.values.push(exactValue);
+                        if (!pw.options.values.includes(valUnix)) pw.options.values.push(valUnix);
+                        if (!pw.options.values.includes(valWin)) pw.options.values.push(valWin);
+                    }
+                    const pOldVal = pw.value;
+                    pw.value = exactValue;
+
+                    const pwIdx = parentNode.widgets ? parentNode.widgets.indexOf(pw) : -1;
+                    if (Array.isArray(parentNode.widgets_values)) {
+                        if (pwIdx >= 0 && pwIdx < parentNode.widgets_values.length) {
+                            parentNode.widgets_values[pwIdx] = exactValue;
                         }
-                        if (parentNode.onWidgetChanged) {
-                            try { parentNode.onWidgetChanged(pw.name, pw.value, pOldVal, pw); } catch (e) {}
-                        }
-                        if (parentNode.has_errors) {
-                            parentNode.has_errors = false;
-                            delete parentNode.errors;
-                        }
-                        if (typeof parentNode.setDirtyCanvas === "function") {
-                            parentNode.setDirtyCanvas(true, true);
-                        }
+                    } else if (parentNode.widgets_values && typeof parentNode.widgets_values === "object") {
+                        parentNode.widgets_values[pw.name] = exactValue;
+                    }
+                    if (parentNode.widgets_values_named) {
+                        parentNode.widgets_values_named[pw.name] = exactValue;
+                    }
+
+                    if (pw.callback) {
+                        try { pw.callback(pw.value); } catch (e) {}
+                    }
+                    if (parentNode.onWidgetChanged) {
+                        try { parentNode.onWidgetChanged(pw.name, pw.value, pOldVal, pw); } catch (e) {}
+                    }
+                    if (parentNode.has_errors) {
+                        parentNode.has_errors = false;
+                        delete parentNode.errors;
+                    }
+                    if (typeof parentNode.setDirtyCanvas === "function") {
+                        parentNode.setDirtyCanvas(true, true);
                     }
                 }
 
-                // Also sync any promoted inputs defined on the Subgraph node
-                if (parentNode.inputs && Array.isArray(parentNode.inputs)) {
-                    for (const inp of parentNode.inputs) {
-                        if (inp && inp.widget && (inp.name === w.name || inp.widget.name === w.name)) {
-                            try { inp.widget.value = exactValue; } catch (e) {}
-                        }
-                    }
+                // Sync the specific promoted input connected to this inner node/widget
+                const pinp = findCorrespondingParentInput(parentNode, currentChildNode, currentChildWidget, pw);
+                if (pinp && pinp.widget) {
+                    try { pinp.widget.value = exactValue; } catch (e) {}
                 }
+
+                // For the next outer level in parentChain:
+                currentChildNode = parentNode;
+                if (pw) currentChildWidget = pw;
             }
 
             return true;
@@ -629,6 +857,21 @@ app.registerExtension({
                     const reqFile = String(s.requestedModel).replace(/\\/g, "/").split("/").pop();
                     const defaultSug = String(s.suggestedModel).replace(/\\/g, "/");
 
+                    // Deduplicate alternatives by normalized model path
+                    const seenAltPaths = new Set();
+                    const uniqueAlts = [];
+                    if (s.alternatives && Array.isArray(s.alternatives)) {
+                        for (const alt of s.alternatives) {
+                            if (!alt || !alt.model) continue;
+                            const normAlt = String(alt.model).replace(/\\/g, "/").toLowerCase();
+                            if (!seenAltPaths.has(normAlt)) {
+                                seenAltPaths.add(normAlt);
+                                uniqueAlts.push(alt);
+                            }
+                        }
+                    }
+                    s.alternatives = uniqueAlts;
+
                     let optionsHtml = "";
                     if (s.alternatives && s.alternatives.length > 1) {
                         optionsHtml = `
@@ -640,6 +883,9 @@ app.registerExtension({
                                 }).join('')}
                             </select>
                         `;
+                    } else if (s.alternatives && s.alternatives.length === 1) {
+                        const sugName = String(s.alternatives[0].model).replace(/\\/g, "/").split("/").pop();
+                        optionsHtml = `<span class="smr-sug-tag">Available: ${sugName}</span>`;
                     } else {
                         const sugName = defaultSug.split("/").pop();
                         optionsHtml = `<span class="smr-sug-tag">Available: ${sugName}</span>`;
