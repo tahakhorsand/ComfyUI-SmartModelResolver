@@ -13,6 +13,40 @@ VALID_MODEL_EXTENSIONS: Set[str] = {
     '.safetensors', '.ckpt', '.pt', '.pth', '.bin', '.sft', '.onnx', '.gguf'
 }
 
+# Non-model ComfyUI folder_names_and_paths keys that must never be walked as model weights
+NON_MODEL_CATEGORIES: Set[str] = {
+    'custom_nodes', 'datasets', 'configs', 'diffusers', 'classifiers'
+}
+
+# Model categories that are architecturally compatible for fallback lookup / suggestions
+COMPATIBLE_CATEGORIES: Dict[str, List[str]] = {
+    'text_encoders': ['text_encoders', 'clip'],
+    'clip': ['text_encoders', 'clip'],
+    'diffusion_models': ['diffusion_models', 'unet', 'checkpoints'],
+    'unet': ['diffusion_models', 'unet', 'checkpoints'],
+    'checkpoints': ['checkpoints', 'diffusion_models', 'unet'],
+    'vae': ['vae', 'vae_approx'],
+    'vae_approx': ['vae', 'vae_approx'],
+    'loras': ['loras'],
+    'controlnet': ['controlnet'],
+    'upscale_models': ['upscale_models'],
+}
+
+
+def get_compatible_categories(folder_name: str, folder_paths=None) -> List[str]:
+    """Return deduplicated compatible ComfyUI categories for a given model category."""
+    if not folder_name or folder_name == "ALL":
+        return []
+    map_fn = getattr(folder_paths, "map_legacy", None) if folder_paths is not None else None
+    mapped = map_fn(folder_name) if callable(map_fn) else folder_name
+    raw_cats = COMPATIBLE_CATEGORIES.get(mapped) or COMPATIBLE_CATEGORIES.get(folder_name) or [mapped]
+    result: List[str] = []
+    for cat in raw_cats:
+        mc = map_fn(cat) if callable(map_fn) else cat
+        if mc not in result:
+            result.append(mc)
+    return result
+
 # Generic technical suffix tokens that should not count as model family identity
 GENERIC_SUFFIX_TOKENS: Set[str] = {
     'int8', 'int4', 'int2', 'fp8', 'fp16', 'bf16', 'fp32', 'f32', 'f16', 'fp4',
@@ -21,25 +55,44 @@ GENERIC_SUFFIX_TOKENS: Set[str] = {
     'awq', 'nvfp4', 'mixed', 'comfy', 'comfyui'
 }
 
-KNOWN_MODEL_FAMILIES = [
+PRIMARY_MODEL_FAMILIES = [
     'gemma', 'qwen', 'flux', 'ltx', 'sdxl', 'sd15', 'sd21', 'sd1', 'sd2', 'sd35', 'sd3', 'sd',
-    'hunyuan', 'wan', 'minimax', 'cogvideo', 'mochi', 'aura', 'kolors', 't5', 'clip',
-    'siglip', 'eva02', 'vit', 'chameleon', 'deepseek', 'llama', 'mistral'
+    'hunyuan', 'wan', 'minimax', 'cogvideo', 'mochi', 'aura', 'kolors',
+    'chameleon', 'deepseek', 'llama', 'mistral'
 ]
+PRIMARY_MODEL_FAMILIES_SET = set(PRIMARY_MODEL_FAMILIES)
+COMPONENT_FAMILIES = ['t5', 'clip', 'siglip', 'eva02', 'vit']
+KNOWN_MODEL_FAMILIES = PRIMARY_MODEL_FAMILIES + COMPONENT_FAMILIES
+
+
+def _token_matches_family(token: str, kf: str) -> bool:
+    """Match model family token using boundaries to avoid false substrings (e.g. swan->wan)."""
+    if token == kf:
+        return True
+    if re.match(rf'^{re.escape(kf)}(?:\d|$)', token):
+        return True
+    if (kf == 't5' and token.startswith('t5xxl')) or (kf == 'ltx' and token.startswith('ltxv')):
+        return True
+    if len(kf) >= 5 and kf in token:
+        return True
+    return False
+
 
 def extract_semantic_features(name: str) -> dict:
     name_clean = re.sub(r'\.(safetensors|ckpt|pt|pth|bin|sft|onnx|gguf)$', '', name.lower())
     name_clean = re.sub(r'sd[-_]xl', 'sdxl', name_clean)
-    name_clean = re.sub(r'sd[-_]?1[-_]?5', 'sd15', name_clean)
-    name_clean = re.sub(r'sd[-_]?2[-_]?1', 'sd21', name_clean)
-    name_clean = re.sub(r'sd[-_]?3[-_]?5', 'sd35', name_clean)
-    name_clean = re.sub(r'sd[-_]?3', 'sd3', name_clean)
+    name_clean = re.sub(r'sd[-_.]?1[-_.]?5', 'sd15', name_clean)
+    name_clean = re.sub(r'sd[-_.]?2[-_.]?1', 'sd21', name_clean)
+    name_clean = re.sub(r'sd[-_.]?3[-_.]?5', 'sd35', name_clean)
+    name_clean = re.sub(r'sd[-_.]?3(?!\d)', 'sd3', name_clean)
 
-    raw_tokens = re.split(r'[-_.\s/]+', name_clean)
+    # Split on separators while keeping decimal numbers like 1.3b or 2.5 intact
+    raw_tokens = re.split(r'[-_\s/]+|(?<!\d)\.|(?<=\d)\.(?!\d)', name_clean)
     tokens = [t for t in raw_tokens if t]
 
     sizes = set()
     families = set()
+    primary_families = set()
     filtered_tokens = set()
 
     for t in tokens:
@@ -49,8 +102,10 @@ def extract_semantic_features(name: str) -> dict:
 
         found_fam = False
         for kf in KNOWN_MODEL_FAMILIES:
-            if t == kf or t.startswith(kf) or (len(kf) >= 3 and kf in t):
+            if _token_matches_family(t, kf):
                 families.add(kf)
+                if kf in PRIMARY_MODEL_FAMILIES_SET:
+                    primary_families.add(kf)
                 found_fam = True
                 break
 
@@ -62,14 +117,21 @@ def extract_semantic_features(name: str) -> dict:
         'tokens': set(tokens),
         'content_tokens': filtered_tokens,
         'sizes': sizes,
-        'families': families
+        'families': families,
+        'primary_families': primary_families
     }
+
 
 def calculate_model_similarity(req_name: str, cand_name: str) -> float:
     req_f = extract_semantic_features(req_name)
     cand_f = extract_semantic_features(cand_name)
 
     seq_score = difflib.SequenceMatcher(None, req_f['name_clean'], cand_f['name_clean']).ratio()
+
+    # Primary architecture mismatch always yields 0.0 even if both share a component tag like 'clip'
+    if req_f['primary_families'] and cand_f['primary_families']:
+        if not req_f['primary_families'].intersection(cand_f['primary_families']):
+            return 0.0
 
     fam_match = False
     if req_f['families'] and cand_f['families']:
@@ -131,15 +193,37 @@ class SmartModelIndex:
 
                 folder_map = getattr(folder_paths, "folder_names_and_paths", {})
                 for cat, (dirs, exts) in folder_map.items():
+                    if cat in NON_MODEL_CATEGORIES:
+                        continue
+                    exts_set = {e.lower() for e in exts if isinstance(e, str)} if exts else set()
+                    if not (exts_set & VALID_MODEL_EXTENSIONS):
+                        continue
+
                     cat_list = []
                     seen_rel = set()
 
-                    # 1. Physical directory scan with os.walk
+                    # 1. Physical directory scan with os.walk (with symlink cycle guard)
+                    raw_get_filename_list = getattr(folder_paths, "_smr_orig_get_filename_list", folder_paths.get_filename_list)
                     for d in dirs:
                         if not os.path.isdir(d):
                             continue
+                        try:
+                            visited_real_dirs = {os.path.realpath(d)}
+                        except Exception:
+                            visited_real_dirs = set()
                         for root, subdirs, filenames in os.walk(d, followlinks=True):
-                            subdirs[:] = [sd for sd in subdirs if sd != ".git" and not sd.startswith(".")]
+                            next_subdirs = []
+                            for sd in subdirs:
+                                if sd == ".git" or sd.startswith("."):
+                                    continue
+                                try:
+                                    real_sd = os.path.realpath(os.path.join(root, sd))
+                                    if real_sd not in visited_real_dirs:
+                                        visited_real_dirs.add(real_sd)
+                                        next_subdirs.append(sd)
+                                except Exception:
+                                    continue
+                            subdirs[:] = next_subdirs
                             for fn in filenames:
                                 ext = os.path.splitext(fn)[-1].lower()
                                 if ext in VALID_MODEL_EXTENSIONS:
@@ -155,9 +239,9 @@ class SmartModelIndex:
                                     except Exception:
                                         continue
 
-                    # 2. Also incorporate any files returned by folder_paths.get_filename_list(cat)
+                    # 2. Also incorporate files returned by the unhooked ComfyUI filename list (avoids stale cache feedback)
                     try:
-                        comfy_files = folder_paths.get_filename_list(cat)
+                        comfy_files = raw_get_filename_list(cat)
                         for rel_p in comfy_files:
                             ext = os.path.splitext(rel_p)[-1].lower()
                             if ext in VALID_MODEL_EXTENSIONS:
@@ -182,9 +266,9 @@ class SmartModelIndex:
             except Exception as e:
                 logger.error(f"[SmartModelResolver] Error during indexing: {e}")
 
-    def find_model(self, folder_name: str, requested_name: str, folder_paths) -> Optional[Tuple[str, str, str]]:
+    def find_model(self, folder_name: str, requested_name: str, folder_paths, allow_cross_category: bool = True) -> Optional[Tuple[str, str, str]]:
         """
-        Locates the exact same model file if present in subfolders or other categories.
+        Locates the exact same model file if present in subfolders or (optionally) other categories.
         STRICT: Only matches the EXACT same basename.
         Returns: (full_path, rel_path, match_type) or None
         """
@@ -198,12 +282,24 @@ class SmartModelIndex:
             return None
 
         self.scan_all(folder_paths)
-        folder_name = folder_paths.map_legacy(folder_name)
+        raw_is_unrestricted = (not folder_name) or (folder_name == "ALL")
+        map_fn = getattr(folder_paths, "map_legacy", None)
+        mapped_folder = folder_name if raw_is_unrestricted else (map_fn(folder_name) if callable(map_fn) else folder_name)
+        compatible_cats = set(get_compatible_categories(mapped_folder, folder_paths)) if not raw_is_unrestricted else set()
+        raw_get_full_path = getattr(folder_paths, "_smr_orig_get_full_path", folder_paths.get_full_path)
+
+        def _is_cat_allowed(cat: str) -> bool:
+            if not allow_cross_category:
+                return False
+            if raw_is_unrestricted:
+                return True
+            mapped_cat = map_fn(cat) if callable(map_fn) else cat
+            return mapped_cat in compatible_cats or cat in compatible_cats
 
         def _resolve_full(cat: str, rel: str) -> Optional[str]:
-            cat = folder_paths.map_legacy(cat) if hasattr(folder_paths, "map_legacy") else cat
+            cat = map_fn(cat) if callable(map_fn) else cat
             try:
-                p = folder_paths.get_full_path(cat, rel)
+                p = raw_get_full_path(cat, rel)
                 if p and (os.path.isfile(p) or os.path.islink(p)):
                     return p
             except Exception:
@@ -219,36 +315,37 @@ class SmartModelIndex:
                         return cand
             return None
 
-        # 1. Exact basename match
-        if req_base in self.basename_to_paths:
-            matches = self.basename_to_paths[req_base]
-            # Prioritize target category
+        def _match_from_list(matches: List[Tuple[str, str]]) -> Optional[Tuple[str, str, str]]:
+            # Prioritize exact target category
+            if not raw_is_unrestricted:
+                for cat, rel_p in matches:
+                    mapped_cat = map_fn(cat) if callable(map_fn) else cat
+                    if cat == mapped_folder or mapped_cat == mapped_folder:
+                        full_p = _resolve_full(cat, rel_p)
+                        if full_p:
+                            return full_p, rel_p, "exact_category_subfolder"
+            # Compatible cross-category fallback (or unrestricted when folder_name in ("", "ALL"))
             for cat, rel_p in matches:
-                if cat == folder_name:
+                if _is_cat_allowed(cat):
                     full_p = _resolve_full(cat, rel_p)
                     if full_p:
-                        return full_p, rel_p, "exact_category_subfolder"
-            # Cross-category fallback
-            for cat, rel_p in matches:
-                full_p = _resolve_full(cat, rel_p)
-                if full_p:
-                    return full_p, rel_p, f"cross_category_{cat}"
+                        return full_p, rel_p, f"cross_category_{cat}"
+            return None
+
+        # 1. Exact basename match
+        if req_base in self.basename_to_paths:
+            hit = _match_from_list(self.basename_to_paths[req_base])
+            if hit:
+                return hit
 
         # 2. Extension omitted in query
         if not req_ext:
             for ext in VALID_MODEL_EXTENSIONS:
                 cand = f"{req_base}{ext}"
                 if cand in self.basename_to_paths:
-                    matches = self.basename_to_paths[cand]
-                    for cat, rel_p in matches:
-                        if cat == folder_name:
-                            full_p = _resolve_full(cat, rel_p)
-                            if full_p:
-                                return full_p, rel_p, "exact_category_subfolder"
-                    for cat, rel_p in matches:
-                        full_p = _resolve_full(cat, rel_p)
-                        if full_p:
-                            return full_p, rel_p, f"cross_category_{cat}"
+                    hit = _match_from_list(self.basename_to_paths[cand])
+                    if hit:
+                        return hit
 
         return None
 
@@ -256,7 +353,7 @@ class SmartModelIndex:
         """
         Looks for genuine SIMILAR model candidates (e.g. Gemma, Minimax, Qwen revisions/variants).
         Returns list of (full_path, rel_path, similarity_score) sorted descending by score.
-        Strictly searches only compatible model categories.
+        Strictly searches only compatible model categories (or all categories when folder_name == 'ALL').
         """
         if not requested_name or not isinstance(requested_name, str):
             return []
@@ -268,22 +365,11 @@ class SmartModelIndex:
         if req_ext and req_ext not in VALID_MODEL_EXTENSIONS:
             return []
 
+        raw_is_all = (folder_name == "ALL")
         self.scan_all(folder_paths)
-        folder_name = folder_paths.map_legacy(folder_name)
+        folder_name = folder_name if raw_is_all else folder_paths.map_legacy(folder_name)
 
-        compatible_map = {
-            "text_encoders": ["text_encoders", "clip"],
-            "clip": ["text_encoders", "clip"],
-            "diffusion_models": ["diffusion_models", "unet", "checkpoints"],
-            "unet": ["diffusion_models", "unet", "checkpoints"],
-            "checkpoints": ["checkpoints", "diffusion_models"],
-            "vae": ["vae", "vae_approx"],
-            "loras": ["loras"],
-            "controlnet": ["controlnet"],
-            "upscale_models": ["upscale_models"],
-        }
-
-        search_cats = compatible_map.get(folder_name, [folder_name])
+        search_cats = list(self.cached_files_by_category.keys()) if raw_is_all else get_compatible_categories(folder_name, folder_paths)
         candidates = []
         for cat in search_cats:
             mapped_cat = folder_paths.map_legacy(cat) if hasattr(folder_paths, "map_legacy") else cat
@@ -291,13 +377,14 @@ class SmartModelIndex:
                 for rel_p in self.cached_files_by_category[mapped_cat]:
                     candidates.append((mapped_cat, rel_p))
 
+        raw_get_full_path = getattr(folder_paths, "_smr_orig_get_full_path", folder_paths.get_full_path)
         seen_rel = set()
         results = []
 
         for cat, rel_p in candidates:
-            if rel_p in seen_rel:
+            if (cat, rel_p) in seen_rel:
                 continue
-            seen_rel.add(rel_p)
+            seen_rel.add((cat, rel_p))
 
             cand_base = os.path.basename(rel_p).lower()
             if cand_base == req_base:
@@ -306,10 +393,10 @@ class SmartModelIndex:
             score = calculate_model_similarity(req_base, cand_base)
             if score >= 0.55:
                 try:
-                    full_p = folder_paths.get_full_path(cat, rel_p)
+                    full_p = raw_get_full_path(cat, rel_p)
                 except Exception:
                     full_p = rel_p
-                results.append((full_p, rel_p, score))
+                results.append((full_p or rel_p, rel_p, score))
 
         results.sort(key=lambda x: x[2], reverse=True)
         return results[:top_k]
